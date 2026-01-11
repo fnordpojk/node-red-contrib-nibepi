@@ -1,4 +1,3 @@
-
 module.exports = function(RED) {
     function nibePrice(config) {
         RED.nodes.createNode(this,config);
@@ -31,7 +30,6 @@ module.exports = function(RED) {
                 let index = conf.home.inside_sensors.findIndex(i => i.name == conf.price['sensor_'+config.system]);
                 if(index!==-1) {
                     var insideSensor = Object.assign({}, conf.home.inside_sensors[index]);
-                    //let insideSensor = conf.home.inside_sensors[index];
                     arr.push(insideSensor);
                 }
             }
@@ -90,14 +88,13 @@ module.exports = function(RED) {
                 this.send({topic:"Graf",payload:[]});
                 this.send({topic:"Graf",payload:data.values});
             }
-            
         });
+        // === FIX: forward pool graph as its own topic so Price 1.1 can route it ===
         server.nibeData.on('pluginPriceGraphPool', (data) => {
             if(data.system===config.system) {
-                this.send({topic:"Graf Pool",payload:[]});
+                this.warn("POOL-GRAPH sys="+data.system+" len="+(data.values?data.values.length:0)); this.send({topic:"Graf Pool",payload:[]});
                 this.send({topic:"Graf Pool",payload:data.values});
             }
-            
         });
         server.nibeData.on('pluginPrice', (data) => {
             if(data.system===config.system) {
@@ -106,13 +103,11 @@ module.exports = function(RED) {
                     this.send({topic:"Nuvarande Elprisnivå (VV)",payload:data.hw_price_level.data});
                     this.send({topic:"Nuvarande Elpris",payload:data.price_current.data});
                     this.send([null,{topic:"test",payload:data}]);
-
                 } else {
                     this.send({topic:"Nuvarande Elprisnivå",payload:data.price_level.data});
                     this.send({topic:"Nuvarande Elpris",payload:data.price_current.data});
                     this.send([null,{topic:"test",payload:data}]);
                 }
-                
             }
         })
 

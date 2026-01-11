@@ -29,7 +29,8 @@
       "nibe-hotwater": "hotwater.js",
       "nibe-rmu": "rmu.js",
       "nibe-fan": "fan.js",
-      "nibe-graph": "graph.js"
+      "nibe-graph": "graph.js",
+      "hotwater_ai": "hotwater_ai.js"
     }
   },
   "scripts": {

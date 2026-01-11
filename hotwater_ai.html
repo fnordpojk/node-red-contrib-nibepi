@@ -1,0 +1,91 @@
+<script type="text/x-red" data-template-name="nibe-hotwater-ai">
+    <div class="form-row">
+        <label for="node-input-server"><i class="fa fa-plug"></i> Server</label>
+        <input type="text" id="node-input-server">
+    </div>
+
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Namn</label>
+        <input type="text" id="node-input-name" placeholder="Nibe Hotwater AI">
+    </div>
+
+    <div class="form-row">
+        <label for="node-input-topic"><i class="fa fa-comment"></i> Topic</label>
+        <input type="text" id="node-input-topic" placeholder="nibe_vv_ai">
+    </div>
+
+    <div class="form-tips">
+        <p>
+            Om en <b>Server</b> r vald lyssnar noden p backend-eventet
+            <code>pluginHotwaterAI</code> frn NibePi och skickar ut VV-AI-paketet
+            (profil, BT6/BT7, min-temp, preheat m.m.) i <code>msg.payload</code>.
+        </p>
+        <p>
+            Om inget backend-paket finns kan du fortfarande skicka in BT7 till noden
+            (t.ex. i <code>msg.bt7</code> eller som <code>msg.payload</code> med
+            <code>topic</code> som innehller "bt7"). Noden lr d en egen 168h-veckoprofil
+ och skickar ut profil + i <code>msg.payload</code>.
+        </p>
+    </div>
+</script>
+
+<script type="text/x-red" data-help-name="nibe-hotwater-ai">
+    <p>
+        <b>Nibe Hotwater AI</b> visar VV-AI-data fr varmvatten.
+    </p>
+
+    <h3>Lge 1  Backend (rekommenderas)</h3>
+    <p>
+        Nr en <b>Server</b> (nibe-config) r vald lyssnar noden p backend-eventet
+        <code>pluginHotwaterAI</code> som genereras av NibePi-backenden.
+        Noden skickar d vidare VV-AI-paketet till fldet.
+    </p>
+    <p><code>msg.payload</code> innehller bl.a.:</p>
+    <ul>
+        <li><code>timestamp</code>  tidsstmpel i ms</li>
+        <li><code>hourIndex</code>  0167 (timme i veckan)</li>
+        <li><code>bt6</code>, <code>bt7</code>  aktuella temperaturer</li>
+        <li><code>profile</code>  168-lngds profilvektor</li>
+        <li><code>preheatHours</code>  antal timmar fr frvrmning</li>
+        <li><code>vv_ai_min_temp_enable</code>, <code>vv_ai_min_temp</code>, <code>vv_ai_min_temp_below</code></li>
+    </ul>
+
+    <h3>Lge 2  Legacy (lokal BT7-profil)</h3>
+    <p>
+        Om inget backend-paket anvnds kan noden i stllet ta emot BT7 direkt:
+    </p>
+    <ul>
+        <li><code>msg.bt7</code> (rekommenderas)</li>
+        <li><code>msg.payload</code> + <code>msg.topic</code> som innehller "bt7"</li>
+    </ul>
+    <p>
+        I detta lge lr noden en enkel 168h-veckoprofil av BT7 och skickar ut
+ profil + i <code>msg.payload</code>.
+    </p>
+
+    <h3>Utgng</h3>
+    <p><code>msg.topic</code> stts till nodens Topic (standard <code>nibe_vv_ai</code>).</p>
+</script>
+
+<script type="text/javascript">
+    (function () {
+        RED.nodes.registerType('nibe-hotwater-ai', {
+            category: 'input',
+            color: '#e32222',
+            defaults: {
+                server: { value: "", type: "nibe-config" },
+                name:   { value: "" },
+                topic:  { value: "nibe_vv_ai" }
+            },
+            inputs: 1,
+            outputs: 1,
+            icon: "inject.svg",
+            label: function () {
+                return this.name || "Nibe Hotwater AI";
+            },
+            labelStyle: function () {
+                return this.name ? "node_label_italic" : "";
+            }
+        });
+    })();
+</script>

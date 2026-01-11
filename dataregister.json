@@ -23,6 +23,7 @@
         "inside_factor_s1":"47402",
         "inside_factor_s2":"47401",
         "outdoor_set":"47375",
+        "software version":"43001",
         "dM":"43005",
         "dMstart":"47206",
         "dMadd":"48072",
@@ -58,6 +59,7 @@
         "hw_stop_0":"47049",
         "hw_stop_1":"47048",
         "hw_stop_2":"47047",
+        "hw_period": "47134",
         "bs1_flow":"40050",
         "fan_speed":"47265",
         "alarm":"45001",
@@ -77,7 +79,10 @@
         "lock_freq_1_min":"48662",
         "lock_freq_1_max":"48664",
         "lock_freq_2_min":"48661",
+	"hw_production": "47387",
         "lock_freq_2_max":"48663"
+        
+
     },
     "sSeries": {
         "inside":"30026",

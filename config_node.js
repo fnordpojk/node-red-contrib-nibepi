@@ -1,8 +1,27 @@
 module.exports = function(RED) {
     const EventEmitter = require('events').EventEmitter;
-    require('events').EventEmitter.defaultMaxListeners = 800;
+    require('events').EventEmitter.defaultMaxListeners = 850;
     const https = require('https');
     //const http = require('http');
+    const fs = require('fs');
+    const path = require('path');
+    // Robust bool-tolkning (Node-RED kan ibland ge true/false som strängar)
+    const vvAiIsTrue = (v) => {
+        if (v === true || v === 1) return true;
+        if (typeof v === 'string') {
+            const s = v.trim().toLowerCase();
+            return (s === 'true' || s === '1' || s === 'on' || s === 'yes');
+        }
+        return false;
+    };
+    const vvAiIsFalse = (v) => {
+        if (v === false || v === 0) return true;
+        if (typeof v === 'string') {
+            const s = v.trim().toLowerCase();
+            return (s === 'false' || s === '0' || s === 'off' || s === 'no');
+        }
+        return false;
+    };
     const nibeData = new EventEmitter()
     const nibe = require('nibepi')
     var serialPort = "";
@@ -19,6 +38,1837 @@ module.exports = function(RED) {
     let priceOffset = {};
     let savedGraph = {};
     let savedData = {};
+
+    const VV_AI_STORE_FILE = path.join(__dirname, 'vv_ai_profile.json');
+    let vvAiStore = null;
+    let vvAiPriceCache = null; // VV-AI: prislista i RAM (ingen SD-skrivning)
+    let vvLastBt6 = null;
+    let vvCurrentDrop = 0;
+    let vvInEvent = false;
+    // BT6-inlärning: spåra event-längd och avsluta när tappet går långsamt (efter minst 5 min)
+    let vvEventStartTs = null;
+    let vvLowRateCount = 0; // antal tickar i rad med "långsamt tapp"
+
+    let vvLastAiControl = false;
+    let vvManualHwMode = null;
+    let vvManualHwPeriod = null;
+    let vvLastManualSchedule = false; // tidsstyrning VV – tidigare läge (on/off)
+    let vvManualHwPeriodSchedule = null; // cache för hw_period när tidsstyrning används
+
+
+    function ensureVvAiStore() {
+        if (vvAiStore && Array.isArray(vvAiStore.profile) && vvAiStore.profile.length === 168) {
+            if (!Array.isArray(vvAiStore.tempPlan) || vvAiStore.tempPlan.length !== 168) {
+                vvAiStore.tempPlan = new Array(168).fill(0);
+            }
+            if (!Array.isArray(vvAiStore.modePlan) || vvAiStore.modePlan.length !== 168) {
+                vvAiStore.modePlan = new Array(168).fill(0);
+            }
+            vvAiStore.meta = vvAiStore.meta || {};
+            return vvAiStore;
+        }
+        try {
+            const raw = fs.readFileSync(VV_AI_STORE_FILE, 'utf8');
+            const parsed = JSON.parse(raw);
+            if (parsed && Array.isArray(parsed.profile) && parsed.profile.length === 168) {
+                vvAiStore = parsed;
+                if (!Array.isArray(vvAiStore.tempPlan) || vvAiStore.tempPlan.length !== 168) {
+                    vvAiStore.tempPlan = new Array(168).fill(0);
+                }
+                if (!Array.isArray(vvAiStore.modePlan) || vvAiStore.modePlan.length !== 168) {
+                    vvAiStore.modePlan = new Array(168).fill(0);
+                }
+                vvAiStore.meta = vvAiStore.meta || {};
+                return vvAiStore;
+            }
+        } catch (err) {
+            nibe.log(`VV-AI load error: ${err}`, 'hotwater', 'error');
+        }
+        vvAiStore = {
+            profile: new Array(168).fill(0),
+            tempPlan: new Array(168).fill(0),
+            modePlan: new Array(168).fill(0),
+            meta: {}
+        };
+        try {
+            fs.writeFileSync(VV_AI_STORE_FILE, JSON.stringify(vvAiStore, null, 2), 'utf8');
+        } catch (err) {
+            nibe.log(`VV-AI init save error: ${err}`, 'hotwater', 'error');
+        }
+        return vvAiStore;
+    }
+
+
+    // Bygger ett 48h-prisfönster för VV-AI utifrån vvAiPriceCache.
+    // Resultat: array med objekt { ts, price_ore } sorterad på stigande ts.
+    function vvAiBuildPriceHorizon(tsNow, priceCache) {
+        try {
+            if (!priceCache || !Array.isArray(priceCache) || priceCache.length === 0) {
+                return null;
+            }
+            const start = new Date(tsNow);
+            start.setHours(0, 0, 0, 0);
+            const startMs = start.getTime();
+            const endMs = startMs + 48 * 3600 * 1000;
+
+            const window = [];
+            for (const p of priceCache) {
+                if (!p || !p.startsAt) continue;
+                const t = new Date(p.startsAt).getTime();
+                if (!Number.isFinite(t)) continue;
+                if (t < startMs || t > endMs) continue;
+                const total = Number(p.total);
+                if (!Number.isFinite(total)) continue;
+                const priceOre = Number((total * 100).toFixed(2)); // SEK/kWh -> öre/kWh
+                window.push({ ts: t, price_ore: priceOre });
+            }
+
+            if (window.length === 0) {
+                return null;
+            }
+            window.sort((a, b) => a.ts - b.ts);
+            return window;
+        } catch (e) {
+            // Om något går fel här vill vi inte störa övrig VV-AI-logik.
+            return null;
+        }
+    }
+
+
+
+    function saveVvAiStore() {
+        if (!vvAiStore) return;
+        try {
+            vvAiStore.meta = vvAiStore.meta || {};
+            const now = Date.now();
+            const last = (vvAiStore.meta && typeof vvAiStore.meta.lastSaveTs === 'number')
+                ? vvAiStore.meta.lastSaveTs
+                : 0;
+
+            // Spara som mest en gång per timme för att undvika att blockera Node-RED varje minut
+            if (now - last < 60 * 60 * 1000) {
+                return;
+            }
+            vvAiStore.meta.lastSaveTs = now;
+
+            // Bygg ett persist-objekt utan kortlivade/pris-relaterade meta-fält.
+            const persist = {
+                profile: (Array.isArray(vvAiStore.profile) && vvAiStore.profile.length === 168)
+                    ? vvAiStore.profile
+                    : new Array(168).fill(0),
+                tempPlan: (Array.isArray(vvAiStore.tempPlan) && vvAiStore.tempPlan.length === 168)
+                    ? vvAiStore.tempPlan
+                    : new Array(168).fill(0),
+                modePlan: (Array.isArray(vvAiStore.modePlan) && vvAiStore.modePlan.length === 168)
+                    ? vvAiStore.modePlan
+                    : new Array(168).fill(0),
+                meta: {}
+            };
+
+            const srcMeta = vvAiStore.meta || {};
+            const keepMetaKeys = ['lastPlanBuild', 'lastLearnTs', 'lastDropDeg', 'lastIndex'];
+            for (const key of keepMetaKeys) {
+                if (Object.prototype.hasOwnProperty.call(srcMeta, key)) {
+                    persist.meta[key] = srcMeta[key];
+                }
+            }
+
+            fs.writeFile(VV_AI_STORE_FILE, JSON.stringify(persist, null, 2), 'utf8', (err) => {
+                if (err) {
+                    nibe.log(`VV-AI store write error: ${err}`, 'hotwater', 'error');
+                }
+            });
+        } catch (err) {
+            nibe.log(`VV-AI store save error: ${err}`, 'hotwater', 'error');
+        }
+    }
+    function getVvAlpha(hw) {
+        let rate = Number(hw.vv_ai_learning_rate);
+        const useSlider = (hw.vv_ai_learning_rate_enable === true);
+        if (!useSlider || !Number.isFinite(rate) || rate <= 0) {
+            rate = 10;
+        }
+        if (rate < 1) rate = 1;
+        if (rate > 10) rate = 10;
+        return rate / 100;
+    }
+
+    function vvAiPad2(n) { return String(n).padStart(2, '0'); }
+    function vvAiLocalDateKeyFromTs(ts) {
+        const d = new Date(ts);
+        return `${d.getFullYear()}-${vvAiPad2(d.getMonth() + 1)}-${vvAiPad2(d.getDate())}`;
+    }
+
+    function vvAiApplyDailyDecayIfNeeded(store, hw, newKey) {
+            if (!store) return;
+            store.meta = store.meta || {};
+            const meta = store.meta;
+
+            // Hjälpare: YYYY-MM-DD → lokal Date (midnatt lokal tid)
+            function vvAiDateKeyToLocalDate(key) {
+                if (typeof key !== 'string') return null;
+                const m = /^([0-9]{4})-([0-9]{2})-([0-9]{2})$/.exec(key.trim());
+                if (!m) return null;
+                const y = Number(m[1]);
+                const mo = Number(m[2]);
+                const d = Number(m[3]);
+                if (!Number.isFinite(y) || !Number.isFinite(mo) || !Number.isFinite(d)) return null;
+                const dt = new Date(y, mo - 1, d);
+                if (!dt || isNaN(dt.getTime())) return null;
+                return dt;
+            }
+
+            function vvAiApplyDecayForLocalDate(dt, seenArr, decayFactor) {
+                if (!dt || isNaN(dt.getTime())) return;
+
+                // Veckodag för denna kalenderdag → index i profilen (måndag=0)
+                let dow = dt.getDay(); // 0=sön .. 6=lör
+                const dayIndex = (dow + 6) % 7; // 0=mån .. 6=sön
+                const startIdx = dayIndex * 24;
+                const endIdx = startIdx + 24;
+
+                const seen = (Array.isArray(seenArr) && seenArr.length === 168)
+                    ? seenArr
+                    : new Array(168).fill(false);
+
+                if (Array.isArray(store.profile) && store.profile.length === 168) {
+                    for (let i = startIdx; i < endIdx; i++) {
+                        if (!seen[i]) {
+                            const oldVal = Number(store.profile[i]) || 0;
+                            const decayed = oldVal * decayFactor;
+                            store.profile[i] = Number(decayed.toFixed(3));
+                        }
+                    }
+                }
+            }
+
+            // init
+            if (!meta.vvAiSeenTodayKey) {
+                meta.vvAiSeenTodayKey = newKey;
+                meta.vvAiSeenToday = new Array(168).fill(false);
+                return;
+            }
+
+            if (meta.vvAiSeenTodayKey === newKey) {
+                // samma dag – inget att göra här
+                if (!Array.isArray(meta.vvAiSeenToday) || meta.vvAiSeenToday.length !== 168) {
+                    meta.vvAiSeenToday = new Array(168).fill(false);
+                }
+                return;
+            }
+
+            // Ny dag: decaya ENDAST den gamla dagens 24 slots (veckodag*24..+23) som inte setts.
+            const alpha = getVvAlpha(hw || {});
+            const decayFactor = 1 - alpha; // ex: alpha=0.05 => 5% per "passerad dag" på ej använda timmar
+
+            const seenOld = (Array.isArray(meta.vvAiSeenToday) && meta.vvAiSeenToday.length === 168)
+                ? meta.vvAiSeenToday
+                : new Array(168).fill(false);
+
+            const oldKey = meta.vvAiSeenTodayKey;
+            const oldDate = vvAiDateKeyToLocalDate(oldKey);
+            const newDate = vvAiDateKeyToLocalDate(newKey);
+
+            if (!oldDate || !newDate) {
+                // Fallback: om datum inte går att tolka, kör gamla beteendet (decay på alla 168 unseen)
+                if (Array.isArray(store.profile) && store.profile.length === 168) {
+                    for (let i = 0; i < 168; i++) {
+                        if (!seenOld[i]) {
+                            const oldVal = Number(store.profile[i]) || 0;
+                            const decayed = oldVal * decayFactor;
+                            store.profile[i] = Number(decayed.toFixed(3));
+                        }
+                    }
+                }
+            } else {
+                // 1) Decay för dagen som just avslutades (oldKey) – endast 24 slots för den veckodagen
+                vvAiApplyDecayForLocalDate(oldDate, seenOld, decayFactor);
+
+                // 2) Om vi hoppat över dagar (t.ex. systemet stod still): decaya varje missad kalenderdag en gång
+                //    (ingen "seen"-info finns för missade dagar, så de räknas som osedda)
+                const d = new Date(oldDate.getTime());
+                d.setDate(d.getDate() + 1);
+
+                let guard = 0; // säkerhetsbroms
+                while (d.getTime() < newDate.getTime() && guard < 32) {
+                    vvAiApplyDecayForLocalDate(d, null, decayFactor);
+                    d.setDate(d.getDate() + 1);
+                    guard++;
+                }
+            }
+
+            // reset för nya dagen
+            meta.vvAiSeenTodayKey = newKey;
+            meta.vvAiSeenToday = new Array(168).fill(false);
+            meta.lastDecayKey = newKey;
+            meta.lastDecayTs = Date.now();
+        }
+
+function vvAiMarkSeenToday(store, hw, idx, ts) {
+            if (!store || !Number.isInteger(idx) || idx < 0 || idx >= 168) return;
+            store.meta = store.meta || {};
+            const key = vvAiLocalDateKeyFromTs(ts || Date.now());
+            vvAiApplyDailyDecayIfNeeded(store, hw, key);
+            if (!Array.isArray(store.meta.vvAiSeenToday) || store.meta.vvAiSeenToday.length !== 168) {
+                store.meta.vvAiSeenToday = new Array(168).fill(false);
+            }
+            store.meta.vvAiSeenToday[idx] = true;
+        }
+
+    function getVvMinDrop(hw) {
+        const useSlider = (hw.vv_ai_min_drop_bt6_enable === true);
+        let d = Number(hw.vv_ai_min_drop);
+        // Om slidern inte är aktiv eller värdet är ogiltigt/<=0 → använd backend-standard 3°C
+        if (!useSlider || !Number.isFinite(d) || d <= 0) {
+            d = 3; // default 3 °C
+        }
+        return d;
+    }
+
+    function getWeekHourIndex(ts) {
+        const d = new Date(ts);
+        const dow = d.getDay(); // 0=sun .. 6=sat
+        const dayIndex = (dow + 6) % 7; // 0=mon..6=sun
+        const hour = d.getHours();
+        return dayIndex * 24 + hour; // 0..167
+    }
+
+    function registerVvDraw(cfgHotwater, dropDeg, ts) {
+        if (!Number.isFinite(dropDeg) || dropDeg <= 0.1) {
+            return;
+        }
+        const store = ensureVvAiStore();
+        const idx = getWeekHourIndex(ts);
+        vvAiMarkSeenToday(store, cfgHotwater || {}, idx, ts);
+        if (!Array.isArray(store.profile) || store.profile.length !== 168) {
+            store.profile = new Array(168).fill(0);
+        }
+        const alpha = getVvAlpha(cfgHotwater || {});
+        const oldVal = Number(store.profile[idx]) || 0;
+        const measurement = dropDeg;
+        const blended = oldVal * (1 - alpha) + measurement * alpha;
+        store.profile[idx] = Number(blended.toFixed(3));
+        store.meta = store.meta || {};
+        store.meta.lastLearnTs = ts;
+        store.meta.lastDropDeg = dropDeg;
+        store.meta.lastIndex = idx;
+        saveVvAiStore();
+    }
+
+
+    async function vvAiBuildPlan(store, hw) {
+        try {
+            if (!store) return;
+            if (!Array.isArray(store.profile) || store.profile.length !== 168) {
+                return;
+            }
+            // Daglig decay på timmar utan event (kopplad till vv_ai_learning_rate)
+            vvAiApplyDailyDecayIfNeeded(store, hw || {}, vvAiLocalDateKeyFromTs(Date.now()));
+            const profile = store.profile.map(v => {
+                const n = Number(v);
+                return Number.isFinite(n) && n > 0 ? n : 0;
+            });
+
+            const tempPlan = new Array(168).fill(0);
+            const modePlan = new Array(168).fill(0);
+
+            // Nattspärr för VV-plan: AI-planerad värmning får aldrig ligga mellan 00:00 och 03:00.
+            // (Min-temp-failsafe kan fortfarande trigga om du har den på.)
+            const VV_NIGHT_BLOCK_FROM_H = 0;
+            const VV_NIGHT_BLOCK_TO_H = 3;
+
+            const daySum = new Array(7).fill(0);
+            const dayMax = new Array(7).fill(0);
+
+            for (let i = 0; i < 168; i++) {
+                const v = profile[i];
+
+                // Räkna tidiga natt-timmar (00:00–02:00) till föregående dag
+                const hour = i % 24;
+                const dayRaw = Math.floor(i / 24);
+                const day = (hour < 2) ? ((dayRaw + 6) % 7) : dayRaw;
+
+                daySum[day] += v;
+                if (v > dayMax[day]) dayMax[day] = v;
+            }
+
+            // Trösklar för hur "tung" dagen är (i °C BT6-drop)
+            let smallThr = Number(hw.vv_ai_day_small_threshold);
+            if (!Number.isFinite(smallThr) || smallThr <= 0) smallThr = 1.0;
+
+            let mediumThr = Number(hw.vv_ai_day_medium_threshold);
+            if (!Number.isFinite(mediumThr) || mediumThr <= smallThr) mediumThr = 3.0;
+
+            let largeThr = Number(hw.vv_ai_day_large_threshold);
+            if (!Number.isFinite(largeThr) || largeThr <= mediumThr) largeThr = 6.0;
+
+            // Elprisstyrning + prisfönster (används både för plan och graf)
+            const priceControlEnabled = vvAiIsTrue(hw && hw.vv_ai_use_price_enable);
+
+            // Prisfönster: standard 7h från backend, eller användarens eget värde om vv_ai_price_window_enable = true.
+            const priceWindowOverrideEnabled = vvAiIsTrue(hw && hw.vv_ai_price_window_enable);
+            let priceWindowHours = 7;
+            if (priceWindowOverrideEnabled) {
+                let tmpHours = hw ? Number(hw.vv_ai_price_window_hours) : NaN;
+                if (Number.isFinite(tmpHours) && tmpHours > 0) {
+                    if (tmpHours > 24) tmpHours = 24;
+                    priceWindowHours = tmpHours;
+                }
+            }
+
+            // Förvärmning & fönsterlängd
+            const preheatEnabled = vvAiIsTrue(hw && hw.vv_ai_preheat_enable);
+            let preheatHours = Number(hw.vv_ai_preheat_hours);
+            if (!Number.isFinite(preheatHours) || preheatHours < 0) preheatHours = 0;
+            if (preheatHours > 12) preheatHours = 12;
+
+            // Om preheat-switchen är AV vill vi ändå köra en standard-förvärmning
+            // på 2 timmar före planerat VV-uttag. När switchen är PÅ används
+            // sliderns värde (0–12 h).
+            if (!preheatEnabled) {
+                // När elprisstyrning är PÅ vill vi att default-preheat matchar sökfönstret,
+                // annars blir prislogiken begränsad till bara de timmar som VV-planen redan täcker.
+                preheatHours = 2;
+            }
+            // Clamp igen om vi satte defaulten ovan (priceWindowHours kan vara större än 12)
+            if (preheatHours > 12) preheatHours = 12;
+
+            // Elpris-tabell (0..167) om vvAiTick redan byggt den (annars null)
+            const priceByIndex = (store && store.meta && Array.isArray(store.meta.vvPriceByIndex))
+                ? store.meta.vvPriceByIndex
+                : null;
+
+
+            // vv_ai_heat_window_hours finns kvar för framtida bruk men
+            // används inte längre för att flytta fönstret; fönstret definieras
+            // av preheat (start) och peaktimmen (slut).
+            let windowLen = Number(hw.vv_ai_heat_window_hours);
+            if (!Number.isFinite(windowLen) || windowLen <= 0) windowLen = 1;
+            if (windowLen > 8) windowLen = 8;
+
+            // Stopptemperaturer för Eco / Normal / Lyx.
+// Primär källa: vv_stop_eco/normal/lux i hw-objektet (uppdateras av vvAiTick från hP['hw_stop_0/1/2']).
+// Fallback: läs direkt från Nibe om vv_stop_* saknas.
+            let ecoStop = NaN;
+            let normalStop = NaN;
+            let luxStop = NaN;
+
+            // 1) Läs från hw.vv_stop_* om de finns
+            if (hw) {
+                const tEco = Number(hw.vv_stop_eco);
+                if (Number.isFinite(tEco)) ecoStop = tEco;
+
+                const tNormal = Number(hw.vv_stop_normal);
+                if (Number.isFinite(tNormal)) normalStop = tNormal;
+
+                const tLux = Number(hw.vv_stop_lux);
+                if (Number.isFinite(tLux)) luxStop = tLux;
+            }
+
+            // 2) Fallback: läs direkt från Nibe (samma index som vvAiTick: 0=Eco, 1=Normal, 2=Lux)
+            if (!Number.isFinite(ecoStop)) {
+                try {
+                    const rEco = await getNibeData(hP['hw_stop_0']).catch(() => undefined);
+                    if (rEco && typeof rEco.data === 'number' && Number.isFinite(rEco.data)) {
+                        ecoStop = rEco.data;
+                    }
+                } catch (e) {
+                    // ignorerar, ecoStop får ev. förbli NaN
+                }
+            }
+
+            if (!Number.isFinite(normalStop)) {
+                try {
+                    const rNormal = await getNibeData(hP['hw_stop_1']).catch(() => undefined);
+                    if (rNormal && typeof rNormal.data === 'number' && Number.isFinite(rNormal.data)) {
+                        normalStop = rNormal.data;
+                    }
+                } catch (e) {
+                    // ignorerar, normalStop får ev. förbli NaN
+                }
+            }
+
+            if (!Number.isFinite(luxStop)) {
+                try {
+                    const rLux = await getNibeData(hP['hw_stop_2']).catch(() => undefined);
+                    if (rLux && typeof rLux.data === 'number' && Number.isFinite(rLux.data)) {
+                        luxStop = rLux.data;
+                    }
+                } catch (e) {
+                    // ignorerar, luxStop får ev. förbli NaN
+                }
+            }
+
+            // Om vi fortfarande saknar någon stopptemperatur efter fallback
+            // lämnas den som NaN, och tempPlan blir då 0 för det läget.
+// Min-temp-golv: används bara om vv_ai_min_temp_enable är true
+            // Min-temp-golv: anses aktiverad så länge vv_ai_min_temp_enable inte är falskt.
+            // (Node-RED kan skicka true, 1, "true" osv.)
+            const minTempEnabled = !!(hw && hw.vv_ai_min_temp_enable !== false);
+            const rawMinTemp = hw ? Number(hw.vv_ai_min_temp) : NaN;
+            const minTemp = Number.isFinite(rawMinTemp) ? rawMinTemp : NaN;
+
+            for (let day = 0; day < 7; day++) {
+                const sum = daySum[day];
+
+                // Ingen värmning alls om dagen är "nästan tom"
+                if (sum < smallThr) continue;
+
+                let dayMode = 0;
+                if (sum < mediumThr) {
+                    dayMode = 1; // liten dag
+                } else if (sum < largeThr) {
+                    dayMode = 2; // normal dag
+                } else {
+                    dayMode = 3; // tung dag
+                }
+
+                if (dayMode === 0) continue;
+
+                
+                const base = day * 24;
+
+                // Hitta dagens huvud-peak (max) som tidigare
+                let maxV = 0;
+                let mainHour = -1;
+
+                // Extra: hitta ev. en andra peak (för 2 uppvärmningar) baserat på profilen.
+                // Användaren vill ha tröskel >3°C (inte 2°C).
+                // Peak-tröskel (profilvärde per timme) för att räkna en timme som "peak-kandidat".
+// Default = 3.0 (backend).
+// Om vv_ai_mode_thresholds_enable=true så kan den styras via slidern vv_ai_day_peaks_threshold.
+let PEAK_THR = 3.0;
+if (hw && hw.vv_ai_mode_thresholds_enable) {
+    const userPeakThr = Number(hw.vv_ai_day_peaks_threshold);
+    if (Number.isFinite(userPeakThr) && userPeakThr > 0) {
+        PEAK_THR = userPeakThr;
+    }
+}
+                const MIN_PEAK_GAP_H = 6; // minst 6h mellan peaks för att räknas som två "tillfällen"
+
+                const peakCandidates = [];
+                // Nattspärr 00–03: om en "peak" råkar ligga på natten så väljer vi istället
+                // bästa (högsta) uttags-timmen senare samma dag (06–23). Då får vi plan även om
+                // användarbeteendet råkar ligga runt midnatt, utan att värma på natten.
+                for (let h = 0; h < 24; h++) {
+                    if (h >= VV_NIGHT_BLOCK_FROM_H && h < VV_NIGHT_BLOCK_TO_H) continue;
+
+                    const v = profile[base + h];
+
+                    if (v > maxV) {
+                        maxV = v;
+                        mainHour = h;
+                    }
+
+                    if (v >= PEAK_THR) {
+                        peakCandidates.push({ h, v });
+                    }
+                }
+if (mainHour < 0) continue;
+
+                // Välj en andra peak: största v som ligger minst MIN_PEAK_GAP_H från huvud-peak
+                let secondHour = -1;
+                let secondV = -1;
+
+                for (const p of peakCandidates) {
+                    if (p.h === mainHour) continue;
+                    if (Math.abs(p.h - mainHour) < MIN_PEAK_GAP_H) continue;
+                    if (p.v > secondV) {
+                        secondV = p.v;
+                        secondHour = p.h;
+                    }
+                }
+
+                // Om vi hittar två tydliga peaks samma dag:
+                // då vill användaren INTE köra Lyx – clamp:a max till Normal (2).
+                if (secondHour >= 0 && dayMode === 3) {
+                    dayMode = 2;
+                }
+
+                const ph = preheatHours;
+
+                // Bygg uppvärmningsfönster för 1 eller 2 peaks (värm fram till start av peak-timmen).
+                const peakHours = (secondHour >= 0)
+                    ? [mainHour, secondHour].sort((a, b) => a - b)
+                    : [mainHour];
+
+                for (const peakHour of peakHours) {
+                    // Default-fönster (utan pris):
+                    // Vi jobbar i 1h-buckets: timme h betyder intervallet [h, h+1).
+                    // Målet är att tanken ska vara varm VID STARTEN av förväntat VV-uttag (peak-timmen),
+                    // dvs vi värmer fram till peakHour (inte peakHour+1).
+                    const minHeatLen = Math.max(1, ph); // minst 1h även om ph=0
+
+                    let startHour = 0;
+                    let endHour = 0;
+
+                    if (peakHour <= 0) {
+                        // Peak vid 00:00 kan inte förvärmas "före" inom samma dygn – kör minsta möjliga fönster i början av dagen.
+                        startHour = 0;
+                        endHour = 1;
+                    } else {
+                        endHour = peakHour; // SLUT = start av peak-timmen
+                        startHour = peakHour - minHeatLen;
+                        if (startHour < 0) startHour = 0;
+                    }
+
+                    // Om elprisstyrning är aktiv: välj en billig START inom priceWindowHours före peak,
+                    // men lås alltid SLUTET till peak-start (endHour = peakHour) så planen sträcker sig hela vägen fram.
+                    // Dessutom: start får aldrig bli senare än (peakHour - minHeatLen), annars hinner vi inte värma klart före peak.
+                    if (priceControlEnabled && priceByIndex && peakHour > 0) {
+                        const lookback = Math.max(minHeatLen, Math.floor(priceWindowHours));
+                        const winStart = Math.max(0, peakHour - lookback);
+
+                        // Sista tillåtna start så att hela blocket (minHeatLen timmar) får plats före peakHour
+                        const winEnd = Math.min(Math.max(0, peakHour - minHeatLen), 23);
+                        if (winEnd >= winStart) {
+                            let bestStart = null;
+                            let bestSum = Infinity;
+
+                            for (let s = winStart; s <= winEnd; s++) {
+                                let sum = 0;
+                                let ok = true;
+
+                                for (let k = 0; k < minHeatLen; k++) {
+                                    const ore = priceByIndex[base + s + k];
+                                    if (ore === null || !Number.isFinite(ore)) { ok = false; break; }
+                                    sum += ore;
+                                }
+                                if (!ok) continue;
+
+                                // Tie-break: om lika billigt, välj den som ligger SENARE (närmast peak)
+                                if (sum < bestSum || (sum === bestSum && (bestStart === null || s > bestStart))) {
+                                    bestSum = sum;
+                                    bestStart = s;
+                                }
+                            }
+
+                            if (bestStart !== null) {
+                                startHour = bestStart;
+                                endHour = Math.min(peakHour, bestStart + minHeatLen); // FIX: håll fönstret = minHeatLen
+                            }
+                        }
+                    }
+
+                    for (let h = startHour; h < endHour; h++) {
+                        if (h >= VV_NIGHT_BLOCK_FROM_H && h < VV_NIGHT_BLOCK_TO_H) continue;
+                        const idx = base + h;
+                        modePlan[idx] = dayMode;
+                        if (dayMode === 1 && Number.isFinite(ecoStop)) {
+                            tempPlan[idx] = ecoStop;
+                        } else if (dayMode === 2 && Number.isFinite(normalStop)) {
+                            tempPlan[idx] = normalStop;
+                        } else if (dayMode === 3 && Number.isFinite(luxStop)) {
+                            tempPlan[idx] = luxStop;
+                        }
+                    }
+                }
+            }
+            // Min-temp-failsafe: fyller "mellanrummen" när vv_ai_min_temp_enable = true.
+            // Själva VV-fönstren (Eco/Normal/Lux) lämnas orörda.
+            if (minTempEnabled && Number.isFinite(minTemp)) {
+                for (let i = 0; i < 168; i++) {
+                    const v = Number(tempPlan[i]);
+                    if (!Number.isFinite(v) || v <= 0) {
+                        tempPlan[i] = minTemp;
+                    }
+                }
+            }
+
+            store.tempPlan = tempPlan;
+            store.modePlan = modePlan;
+            store.meta = store.meta || {};
+            store.meta.lastPlanBuild = Date.now();
+        } catch (e) {
+            nibe.log(`VV-AI plan build error: ${e}`, 'hotwater', 'error');
+        }
+    }
+
+
+function hotwaterAiBuildGraph(store, hw) {
+        try {
+            if (!store) return null;
+
+            // --- VV-AI: prisstyrning / prisfönster (behövs för att kunna bygga grafen) ---
+            // OBS: Node-RED kan spara true/false som strängar, så vi använder vvAiIsTrue().
+            const priceControlEnabled = vvAiIsTrue(hw && hw.vv_ai_use_price_enable);
+
+            // Prisfönster: standard 7h, men kan styras av slider om vv_ai_price_window_enable = true.
+            const priceWindowOverrideEnabled = vvAiIsTrue(hw && hw.vv_ai_price_window_enable);
+            let priceWindowHours = 7;
+            if (priceWindowOverrideEnabled) {
+                let tmpHours = hw ? Number(hw.vv_ai_price_window_hours) : NaN;
+                if (Number.isFinite(tmpHours) && tmpHours > 0) {
+                    if (tmpHours > 24) tmpHours = 24;
+                    priceWindowHours = tmpHours;
+                }
+            }
+
+            const profile = (store && Array.isArray(store.profile) && store.profile.length === 168)
+                ? store.profile
+                : new Array(168).fill(0);
+            const tempPlan = (store && Array.isArray(store.tempPlan) && store.tempPlan.length === 168)
+                ? store.tempPlan
+                : new Array(168).fill(0);
+            const modePlan = (store && Array.isArray(store.modePlan) && store.modePlan.length === 168)
+                ? store.modePlan
+                : new Array(168).fill(0);
+
+            const profileSeries = [];
+            const tempSeries = [];
+            const modeSeries = [];
+            const priceSeries = [];
+            // Ny serie: VV-pris (billigast) = markerar de valda uppvärmningstimmarna
+            const priceWindowHeatSeries = [];
+
+            // Tidsstyrd VV-graf: om vv_manual_schedule_enable är aktiv visar vi
+            // ÖPPET fönster (VV tillåten) + valt VV-läge i stället för AI-planen.
+            const scheduleEnabled = vvAiIsTrue(hw && hw.vv_manual_schedule_enable);
+            const fromMin = hw && Number(hw.vv_manual_schedule_from_min);
+            const toMin = hw && Number(hw.vv_manual_schedule_to_min);
+            const scheduleMode = hw && Number(hw.vv_manual_schedule_mode);
+
+            const validWindow =
+                Number.isFinite(fromMin) && Number.isFinite(toMin) &&
+                fromMin >= 0 && fromMin < 1440 &&
+                toMin >= 0 && toMin < 1440 &&
+                fromMin !== toMin;
+
+            const scheduleGraphActive = scheduleEnabled && validWindow && Number.isFinite(scheduleMode);
+            // Elprisstyrning/prisfönster är redan beräknat ovan (priceControlEnabled + priceWindowHours).
+            // Stopptemperaturer för Eco / Normal / Lux.
+            // Primär källa: vv_stop_eco/normal/lux i hw-objektet (uppdateras av vvAiTick från hP['hw_stop_0/1/2']).
+            let stopEco = NaN;
+            let stopNormal = NaN;
+            let stopLux = NaN;
+
+            if (hw) {
+                const tEco = Number(hw.vv_stop_eco);
+                if (Number.isFinite(tEco)) stopEco = tEco;
+
+                const tNormal = Number(hw.vv_stop_normal);
+                if (Number.isFinite(tNormal)) stopNormal = tNormal;
+
+                const tLux = Number(hw.vv_stop_lux);
+                if (Number.isFinite(tLux)) stopLux = tLux;
+            }
+
+            // Bygg en 168-längds tabell med elpris (öre/kWh) per timindex 0..167.
+            // Försök i första hand använda vvPriceByIndex från vvAiTick (som redan
+            // bygger från vvPriceHorizon och sparar min/max i meta).
+            let priceByIndex = new Array(168).fill(null);
+            let minPrice = NaN;
+            let maxPrice = NaN;
+
+            if (store && store.meta &&
+                Array.isArray(store.meta.vvPriceByIndex) &&
+                store.meta.vvPriceByIndex.length === 168 &&
+                Number.isFinite(store.meta.vvPriceMin) &&
+                Number.isFinite(store.meta.vvPriceMax) &&
+                store.meta.vvPriceMax > store.meta.vvPriceMin) {
+
+                priceByIndex = store.meta.vvPriceByIndex.slice();
+                minPrice = Number(store.meta.vvPriceMin);
+                maxPrice = Number(store.meta.vvPriceMax);
+            } else if (store && store.meta && Array.isArray(store.meta.vvPriceHorizon)) {
+                minPrice = Infinity;
+                maxPrice = -Infinity;
+
+                for (const p of store.meta.vvPriceHorizon) {
+                    if (!p) continue;
+                    const tsVal = Number(p.ts);
+                    const priceOre = Number(p.price_ore);
+                    if (!Number.isFinite(tsVal) || !Number.isFinite(priceOre)) continue;
+
+                    const dt = new Date(tsVal);
+                    if (!dt || isNaN(dt.getTime())) continue;
+
+                    // Kartlägg verklig veckodag/timme → index 0..167 (måndag = 0)
+                    let day = dt.getDay(); // 0 = söndag .. 6 = lördag
+                    day = (day + 6) % 7;   // gör måndag = 0
+                    const hour = dt.getHours();
+                    const idx = day * 24 + hour;
+                    if (idx < 0 || idx >= 168) continue;
+
+                    priceByIndex[idx] = priceOre;
+                    if (priceOre < minPrice) minPrice = priceOre;
+                    if (priceOre > maxPrice) maxPrice = priceOre;
+                }
+
+                if (!Number.isFinite(minPrice) || !Number.isFinite(maxPrice) || maxPrice <= minPrice) {
+                    for (let i = 0; i < 168; i++) priceByIndex[i] = null;
+                    minPrice = NaN;
+                    maxPrice = NaN;
+                }
+            } else {
+                // Ingen prisdata – lämna prisserierna som nollor.
+                priceByIndex = new Array(168).fill(null);
+                minPrice = NaN;
+                maxPrice = NaN;
+            }
+
+const priceGraphActive = !!priceControlEnabled;
+
+// VV-pris (grön): markera endast de 2 billigaste SAMMANHÄNGANDE timmarna (en 2h-klump)
+// inom prisfönstret före dagens peak (mätt via VV-profilens högsta timme).
+// Detta är en ren graf-mask: VV-planen (orange) kan vara längre, men grön visar "när vi tänker värma".
+const vvPriceHeatMask = new Array(168).fill(false);
+
+if (priceGraphActive && !scheduleGraphActive && Array.isArray(priceByIndex) && priceByIndex.length === 168) {
+    // Bygg "VV-pris billigast" utifrån den FAKTISKA VV-planen (modePlan/tempPlan).
+    // Dvs: för varje dags sammanhängande VV-plan-fönster (>=2 timmar) väljer vi den billigaste
+    // 2-timmars-klumpen INOM fönstret. Då kan vi aldrig hamna i läget "VV-plan finns men ingen VV-pris",
+    // även om en natt-peak har flyttats bort i planeringen.
+    //
+    // Nattspärr: markera inte timmar 00:00–03:00 (0,1,2). (Planen försöker också undvika detta.)
+    const NIGHT_BLOCK_FROM_H = 0;
+    const NIGHT_BLOCK_TO_H = 3; // exklusiv
+
+    const pickCheapest2hInRun = (run) => {
+        // run = [{idx, price, temp}] där idx är absolutindex 0..167, och idx ökar med 1
+        if (!Array.isArray(run) || run.length < 2) return null;
+
+        let bestStart = null;
+        let bestCost = Infinity;
+
+        for (let i = 0; i <= run.length - 2; i++) {
+            const idx1 = run[i].idx;
+            const idx2 = run[i + 1].idx;
+
+            const h1 = idx1 % 24;
+            const h2 = idx2 % 24;
+
+            if (h1 >= NIGHT_BLOCK_FROM_H && h1 < NIGHT_BLOCK_TO_H) continue;
+            if (h2 >= NIGHT_BLOCK_FROM_H && h2 < NIGHT_BLOCK_TO_H) continue;
+
+            const p1 = run[i].price;
+            const p2 = run[i + 1].price;
+            if (!Number.isFinite(p1) || !Number.isFinite(p2)) continue;
+
+            const cost = p1 + p2;
+
+            // Tie-break: välj senare block om samma kostnad
+            if (cost < bestCost || (cost === bestCost && (bestStart === null || idx1 > bestStart))) {
+                bestCost = cost;
+                bestStart = idx1;
+            }
+        }
+
+        return bestStart;
+    };
+
+    for (let day = 0; day < 7; day++) {
+        const base = day * 24;
+
+        // Ta ut timmar i denna dag som faktiskt är VV-plan (mode/temp > 0) och har prisdata.
+        const planHours = [];
+        for (let h = 0; h < 24; h++) {
+            const idx = base + h;
+            const m = Number(modePlan[idx]) || 0;
+            const t = Number(tempPlan[idx]) || 0;
+            const pr = priceByIndex[idx];
+
+            if (m > 0 && t > 0 && pr !== null && Number.isFinite(pr)) {
+                planHours.push({ idx, price: pr, temp: t });
+            }
+        }
+
+        if (planHours.length < 2) continue;
+
+        // Bygg sammanhängande "runs" (idx ska vara +1)
+        let run = [planHours[0]];
+        for (let i = 1; i < planHours.length; i++) {
+            const prev = planHours[i - 1];
+            const cur = planHours[i];
+            if (cur.idx === prev.idx + 1) {
+                run.push(cur);
+            } else {
+                // Välj billigaste 2h i tidigare run
+                const best = pickCheapest2hInRun(run);
+                if (best !== null) {
+                    vvPriceHeatMask[best] = true;
+                    vvPriceHeatMask[best + 1] = true;
+                }
+                run = [cur];
+            }
+        }
+
+        // sista run
+        const best = pickCheapest2hInRun(run);
+        if (best !== null) {
+            vvPriceHeatMask[best] = true;
+            vvPriceHeatMask[best + 1] = true;
+        }
+    }
+}
+for (let i = 0; i < 168; i++) {
+                const x = i;
+                const p = Number(profile[i]) || 0;
+                const t = Number(tempPlan[i]) || 0;
+                const m = Number(modePlan[i]) || 0;
+
+                // Visa VV-profil i 0–100-skala i grafen (lagrad profil är fortfarande i °C)
+                const pPct = p * 15;
+                profileSeries.push({ x, y: Number(pPct.toFixed(1)) });
+
+                if (scheduleGraphActive) {
+                    // Beräkna "mittpunkten" på timmen i minuter (0–1439)
+                    const hour = i % 24;
+                    const minuteMid = hour * 60 + 30;
+
+                    // Blockeringsfönster: där VV INTE får gå
+                    // Om fromMin < toMin: block [fromMin, toMin)
+                    // Om fromMin > toMin (över midnatt): block [fromMin, 24h) U [0, toMin)
+                    let inBlocked = false;
+                    if (fromMin < toMin) {
+                        // Enkel: block [fromMin, toMin)
+                        inBlocked = (minuteMid >= fromMin && minuteMid < toMin);
+                    } else {
+                        // Över midnatt: block [fromMin, 24h) U [0, toMin)
+                        inBlocked = (minuteMid >= fromMin || minuteMid < toMin);
+                    }
+
+                    const inOpenWindow = !inBlocked;
+
+                    let planY = 0;
+                    let modeY = 0;
+
+                    if (inOpenWindow && scheduleMode > 0) {
+                        modeY = scheduleMode;
+
+                        if (scheduleMode === 1 && Number.isFinite(stopEco)) {
+                            planY = stopEco;
+                        } else if (scheduleMode === 2 && Number.isFinite(stopNormal)) {
+                            planY = stopNormal;
+                        } else if (scheduleMode === 3 && Number.isFinite(stopLux)) {
+                            planY = stopLux;
+                        }
+                    }
+
+                    tempSeries.push({ x, y: planY });
+                    modeSeries.push({ x, y: modeY });
+                } else {
+                    // Standard: visa AI-planen (tempPlan och modePlan) som tidigare
+                    tempSeries.push({ x, y: Number(t.toFixed(1)) });
+                    modeSeries.push({ x, y: m });
+                }
+
+                // Elpris (relativ skala 0–100) – bara visuellt i grafen.
+                // Om vi saknar pris för timmen → y=null (visas som glapp, inte som "0"/billigast).
+                let priceY = null;
+                const val = priceByIndex[i];
+                if (val !== null && Number.isFinite(val) &&
+                    Number.isFinite(minPrice) && Number.isFinite(maxPrice) && maxPrice > minPrice) {
+                    const norm = (val - minPrice) / (maxPrice - minPrice);
+                    priceY = Number((norm * 100).toFixed(1));
+                }
+                priceSeries.push({ x, y: priceY });
+
+                // VV-prisfönster (graf):
+
+                // VV-pris (graf):
+                // "VV-pris billigast" = 2 sammanhängande timmar (mask) som valts som billigast i dagens prisfönster.
+                // Vi visar endast dessa timmar som "på" (höjd = planens stopptemp), annars 0.
+                let heatY = 0;
+
+                if (priceGraphActive && !scheduleGraphActive) {
+                    const planMode = m;
+                    const planTemp = t;
+
+                    // Visa bara när vi faktiskt har en VV-plan + prisdata på timmen
+                    if (planMode > 0 && planTemp > 0 && val !== null && Number.isFinite(val)) {
+                        if (vvPriceHeatMask[i] === true) {
+                            heatY = Number(planTemp.toFixed(1));
+                        }
+                    }
+                }
+
+                priceWindowHeatSeries.push({ x, y: heatY });
+
+}
+
+            const series = ["VV-plan", "VV-profil", "VV-läge"];
+            const data = [tempSeries, profileSeries, modeSeries];
+            const labels = ["VV-plan", "VV-profil", "VV-läge"];
+
+            // Visa elpris-serien endast när elprisstyrning för VV är aktiv.
+            if (priceGraphActive) {
+                series.push("Elpris (relativ)");
+                data.push(priceSeries);
+                labels.push("Elpris (relativ)");
+            }
+
+            // Lägg bara till VV-pris-serien när elprisstyrning är aktiv.
+            if (priceGraphActive && !scheduleGraphActive) {
+                // Lägg som FÖRSTA serie så den ritas överst i ui_chart
+                series.unshift("VV-pris billigast");
+                data.unshift(priceWindowHeatSeries);
+                labels.unshift("VV-pris billigast");
+            }
+
+            const sendArray = [{
+                series,
+                data,
+                labels
+            }];
+
+            // System 1 för nu – kan utökas senare om vi kör fler system.
+            const system = (hw && typeof hw.system === 'number') ? hw.system : 1;
+
+            return { values: sendArray, system };
+        } catch (e) {
+            nibe.log(`VV-AI graph build error: ${e}`, 'hotwater', 'error');
+            return null;
+        }
+    }
+
+
+
+
+async function vvAiTick() {
+        try {
+            const config = nibe.getConfig() || {};
+            const hw = config.hotwater || {};
+
+            const learningEnabled = (hw.enable_vv_learning === true);
+            const manualScheduleEnabled = (hw.vv_manual_schedule_enable === true);
+            const aiControlEnabled = (hw.enable_vv_ai_control === true);
+            const priceControlEnabled = vvAiIsTrue(hw.vv_ai_use_price_enable);
+
+            // Prisfönster: antingen standard 7h från backend,
+            // eller användarens eget värde om vv_ai_price_window_enable = true.
+            const priceWindowOverrideEnabled = vvAiIsTrue(hw.vv_ai_price_window_enable);
+            let priceWindowHours = 7;
+            if (priceWindowOverrideEnabled) {
+                let tmpHours = hw ? Number(hw.vv_ai_price_window_hours) : NaN;
+                if (Number.isFinite(tmpHours) && tmpHours > 0) {
+                    if (tmpHours > 24) tmpHours = 24;
+                    priceWindowHours = tmpHours;
+                }
+            }
+
+            // Om varken VV-AI, tidsstyrning eller VV-AI-styrning är aktiverad
+            // och vi inte har en pågående tidsstyrning att städa upp efter, gör vi ingenting.
+            if (!learningEnabled && !manualScheduleEnabled && !aiControlEnabled && !vvLastManualSchedule) {
+                return;
+            }
+
+			// Läs stopp-temperaturer för Eco / Normal / Lux direkt från Nibe (hP-nycklar)
+			// hw_stop_0 = Eco, hw_stop_1 = Normal, hw_stop_2 = Lux.
+			// Dessa läggs bara i hw-objektet i RAM – ingen skrivning till configfilen.
+			try {
+				const [stopEco, stopNormal, stopLux] = await Promise.all([
+					getNibeData(hP['hw_stop_0']).catch(() => undefined),
+					getNibeData(hP['hw_stop_1']).catch(() => undefined),
+					getNibeData(hP['hw_stop_2']).catch(() => undefined),
+				]);
+
+				if (stopEco && typeof stopEco.data === 'number' && Number.isFinite(stopEco.data)) {
+					hw.vv_stop_eco = stopEco.data;
+				}
+				if (stopNormal && typeof stopNormal.data === 'number' && Number.isFinite(stopNormal.data)) {
+					hw.vv_stop_normal = stopNormal.data;
+				}
+				if (stopLux && typeof stopLux.data === 'number' && Number.isFinite(stopLux.data)) {
+					hw.vv_stop_lux = stopLux.data;
+				}
+			} catch (e) {
+				// Om läsningen misslyckas låter vi vv_stop_* vara oförändrade,
+				// då blir tempPlan=0 och grafen visar bara profil/VV-läge.
+			}
+
+
+            const store = ensureVvAiStore();
+            store.meta = store.meta || {};
+            store.meta.vvUsePrice = (priceControlEnabled === true);
+            const ts = Date.now();
+
+            // Bygg ett 48h-prisfönster för VV-AI (endast i RAM, ingen SD-skrivning)
+            if (vvAiPriceCache && Array.isArray(vvAiPriceCache) && vvAiPriceCache.length > 0) {
+                const priceHorizon = vvAiBuildPriceHorizon(ts, vvAiPriceCache);
+                if (priceHorizon && priceHorizon.length > 0) {
+                    store.meta.vvPriceHorizon = priceHorizon;
+                } else {
+                    store.meta.vvPriceHorizon = null;
+                }
+            } else {
+                store.meta.vvPriceHorizon = null;
+            }
+
+
+            // Bygg en veckobaserad prisindex-tabell (0..167) + min/max för VV-AI-styrning
+            const priceByIndex = new Array(168).fill(null);
+            let minPrice = Infinity;
+            let maxPrice = -Infinity;
+
+            if (store.meta.vvPriceHorizon && Array.isArray(store.meta.vvPriceHorizon) && store.meta.vvPriceHorizon.length > 0) {
+                for (const p of store.meta.vvPriceHorizon) {
+                    if (!p) continue;
+                    const tsVal = Number(p.ts);
+                    const priceOre = Number(p.price_ore);
+                    if (!Number.isFinite(tsVal) || !Number.isFinite(priceOre)) continue;
+
+                    const dt = new Date(tsVal);
+                    if (!dt || isNaN(dt.getTime())) continue;
+
+                    // Kartlägg verklig veckodag/timme → index 0..167 (måndag = 0)
+                    let day = dt.getDay(); // 0 = söndag .. 6 = lördag
+                    day = (day + 6) % 7;   // gör måndag = 0
+                    const hour = dt.getHours();
+                    const idx = day * 24 + hour;
+                    if (idx < 0 || idx >= 168) continue;
+
+                    priceByIndex[idx] = priceOre;
+                    if (priceOre < minPrice) minPrice = priceOre;
+                    if (priceOre > maxPrice) maxPrice = priceOre;
+                }
+
+                if (!Number.isFinite(minPrice) || !Number.isFinite(maxPrice) || maxPrice <= minPrice) {
+                    for (let i = 0; i < 168; i++) {
+                        priceByIndex[i] = null;
+                    }
+                    minPrice = NaN;
+                    maxPrice = NaN;
+                }
+            } else {
+                for (let i = 0; i < 168; i++) {
+                    priceByIndex[i] = null;
+                }
+                minPrice = NaN;
+                maxPrice = NaN;
+            }
+
+            store.meta.vvPriceByIndex = priceByIndex;
+            store.meta.vvPriceMin = minPrice;
+            store.meta.vvPriceMax = maxPrice;
+
+            // Lokal datumsträng för "dag-stängning" (YYYY-MM-DD) i lokal tid
+            const nowLocal = new Date(ts);
+            const todayStr = nowLocal.getFullYear() + '-' +
+                String(nowLocal.getMonth() + 1).padStart(2, '0') + '-' +
+                String(nowLocal.getDate()).padStart(2, '0');
+
+            // Initiera meta-fält för dagstängning och min-temp-failsafe
+            if (typeof store.meta.hwClosedDate !== 'string') {
+                store.meta.hwClosedDate = null;
+            }
+            if (!Number.isFinite(store.meta.hwClosedUntilIdx)) {
+                store.meta.hwClosedUntilIdx = -1;
+            }
+            if (typeof store.meta.vvMinActive !== 'boolean') {
+                store.meta.vvMinActive = false;
+            }
+            if (!Number.isFinite(store.meta.vvMinTarget)) {
+                store.meta.vvMinTarget = null;
+            }
+
+            let bt6;
+            try {
+                bt6 = await getNibeData(hP['bt6']).catch(() => undefined);
+            } catch (e) {
+                bt6 = undefined;
+            }
+            if (!bt6 || bt6.data === undefined || !Number.isFinite(Number(bt6.data))) {
+                vvLastBt6 = null;
+                vvCurrentDrop = 0;
+                vvInEvent = false;
+                await vvAiBuildPlan(store, hw);
+            store.meta.lastTick = ts;
+                saveVvAiStore();
+                return;
+            }
+
+            const current = Number(bt6.data);
+            const minDrop = getVvMinDrop(hw);
+
+            if (vvLastBt6 === null) {
+                vvLastBt6 = current;
+                vvCurrentDrop = 0;
+                vvInEvent = false;
+            } else {
+                const delta = vvLastBt6 - current; // positivt = tapp (°C per tick)
+
+                if (delta > 0) {
+                    // Starta event (startvillkor/filtrering lämnas oförändrad – vi bygger vidare på befintlig logik)
+                    if (!vvInEvent) {
+                        vvInEvent = true;
+                        vvEventStartTs = ts;
+                        vvLowRateCount = 0;
+                    }
+
+                    vvCurrentDrop += delta;
+
+                    // Avsluta event baserat på "tapphastighet" efter minst 5 minuter:
+                    // - Om tappet inte längre är "aktivt" (långsamt) under flera tickar i rad => duschen är klar.
+                    if (vvInEvent && vvEventStartTs && (ts - vvEventStartTs) >= 5 * 60 * 1000) {
+                        // delta är redan per tick (typiskt 1 min). Trösklar i °C/tick.
+                        if (delta >= 0.4) {
+                            // Aktivt tapp – fortsätt
+                            vvLowRateCount = 0;
+                        } else if (delta < 0.3) {
+                            // Tappet har gått ned i "svans" – räkna tickar i rad
+                            vvLowRateCount++;
+                        } else {
+                            // Mellanzon: varken aktivt tapp eller helt klart – mjuk reset så vi kräver stabilt låg takt
+                            vvLowRateCount = Math.max(0, vvLowRateCount - 1);
+                        }
+
+                        if (vvLowRateCount >= 3) {
+                            if (vvCurrentDrop >= minDrop) {
+                                registerVvDraw(hw, vvCurrentDrop, ts);
+                            }
+                            vvCurrentDrop = 0;
+                            vvInEvent = false;
+                            vvEventStartTs = null;
+                            vvLowRateCount = 0;
+                        }
+                    }
+                } else {
+                    // BT6 sjunker inte längre (planat ut eller stiger) – avsluta event som tidigare
+                    if (vvInEvent && vvCurrentDrop >= minDrop) {
+                        registerVvDraw(hw, vvCurrentDrop, ts);
+                    }
+                    vvCurrentDrop = 0;
+                    vvInEvent = false;
+                    vvEventStartTs = null;
+                    vvLowRateCount = 0;
+                }
+
+                vvLastBt6 = current;
+            }
+
+            await vvAiBuildPlan(store, hw);
+
+            let bt7;
+            try {
+                bt7 = await getNibeData(hP['bt7']).catch(() => undefined);
+            } catch (e) {
+                bt7 = undefined;
+            }
+
+            const bt6Now = (bt6 && bt6.data !== undefined && Number.isFinite(Number(bt6.data)))
+                ? Number(bt6.data)
+                : NaN;
+            const bt7Now = (bt7 && bt7.data !== undefined && Number.isFinite(Number(bt7.data)))
+                ? Number(bt7.data)
+                : NaN;
+
+            let hourIndex = 0;
+            let minutesOfDay = 0;
+            try {
+                const d = new Date(ts);
+                let day = d.getDay(); // 0 = sön .. 6 = lör
+                const hour = d.getHours();
+                const minute = d.getMinutes();
+                minutesOfDay = hour * 60 + minute;
+                // Gör måndag = 0
+                day = (day + 6) % 7;
+                hourIndex = day * 24 + hour;
+                if (hourIndex < 0 || hourIndex > 167) hourIndex = 0;
+            } catch (e) {
+                hourIndex = 0;
+                minutesOfDay = 0;
+            }
+
+            let planTemp = null;
+            if (Array.isArray(store.tempPlan) && store.tempPlan.length === 168) {
+                const v = Number(store.tempPlan[hourIndex]);
+                if (Number.isFinite(v) && v > 0) {
+                    planTemp = v;
+                }
+            }
+
+                        let planMode = 0;
+            if (Array.isArray(store.modePlan) && store.modePlan.length === 168) {
+                const m = Number(store.modePlan[hourIndex]);
+                if (Number.isFinite(m) && m > 0) {
+                    planMode = m;
+                }
+            }
+
+
+            // VV-AI / Tidsstyrning / Min-temp:
+            // Vi håller hw_period alltid på 0 (blockerad) och styr VV-produktion via startHW=4 (Tillfällig lyx),
+            // och stoppar genom att sätta startHW=0 när BT7 nått måltemperaturen.
+            //
+            // Prioritet:
+            // 1) Min-temp (BT7 < vv_ai_min_temp)
+            // 2) Tidsstyrning (utanför blockfönster)
+            // 3) VV-AI veckoplan (endast under planerade timmar och tills dagen "stängts")
+            try {
+                const hwPeriodKey = hP && hP['hw_period'];
+                const startHWKey = hP && hP['startHW'];
+                const hwModeKey = hP && hP['hw_mode'];
+
+                // --- Konfliktskydd: ömsesidigt uteslutande lägen ---
+                // - Tidsstyrning kräver VV-AI-styrning AV.
+                // - VV-AI-styrning får inte vara PÅ om "Varmvattenreglering" (enable_hw_priority / enable_autoluxury) är PÅ.
+                let conf = null;
+                let confDirty = false;
+                try {
+                    conf = nibe.getConfig() || {};
+                    conf.hotwater = conf.hotwater || {};
+                } catch (e) {
+                    conf = null;
+                }
+
+                if (conf && conf.hotwater) {
+                    const hwConf = conf.hotwater;
+
+                    const aiOn = (hwConf.enable_vv_ai_control === true);
+                    const scheduleOn = (hwConf.vv_manual_schedule_enable === true);
+                    const learningOn = (hwConf.enable_vv_learning === true);
+                    const hwRegOn = (hwConf.enable_hw_priority === true) || (hwConf.enable_autoluxury === true);
+
+                    const minTempOn = (hwConf.vv_ai_min_temp_enable === true);
+
+                    if (scheduleOn && aiOn) {
+                        // Om båda är PÅ: stäng av tidsstyrning (kräver att AI är AV)
+                        hwConf.vv_manual_schedule_enable = false;
+                        confDirty = true;
+                    }
+                    // OBS: VV-lärande får vara PÅ samtidigt som tidsstyrning.
+                    // Lärandet påverkar bara profilen (BT6) och skriver inga HW-kommandon.
+                    if (aiOn && hwRegOn) {
+                        // Varmvattenreglering prioriterar: stäng av VV-AI-styrning
+                        hwConf.enable_vv_ai_control = false;
+                        confDirty = true;
+                    }
+                    if (confDirty) {
+                        try { nibe.setConfig(conf); } catch (e) { /* ignore */ }
+                    }
+                }
+
+                // Använd de "effektiva" flagsen (efter ev. auto-avaktivering)
+                const hwEff = (conf && conf.hotwater) ? conf.hotwater : hw;
+                const scheduleEnabled = (hwEff && hwEff.vv_manual_schedule_enable === true);
+                const aiControlEnabled = (hwEff && hwEff.enable_vv_ai_control === true);
+                const learningEnabled = (hwEff && hwEff.enable_vv_learning === true);
+                const hwRegEnabled = (hwEff && ((hwEff.enable_hw_priority === true) || (hwEff.enable_autoluxury === true)));
+
+                const minTempEnabled = (aiControlEnabled && hwEff && hwEff.vv_ai_min_temp_enable === true);
+
+                // Säkerhet: tidsstyrning körs aldrig om VV-AI-styrning är aktivt
+                const scheduleOk = scheduleEnabled && !aiControlEnabled;
+                const aiOk = aiControlEnabled && !hwRegEnabled;
+
+                // För tidsstyrning behöver vi veta om vi är i BLOCK-fönstret just nu.
+                // BLOCK = VV ska INTE tillverkas (hw_period=0). UTANFÖR BLOCK = VV tillåten (hw_period återställs).
+                let scheduleValid = false;
+                let scheduleBlockedNow = false;
+                let scheduleModeNow = 0;
+                let scheduleFromMinNow = NaN;
+                let scheduleToMinNow = NaN;
+
+                if (scheduleOk) {
+                    scheduleFromMinNow = Number(hw && hw.vv_manual_schedule_from_min);
+                    scheduleToMinNow = Number(hw && hw.vv_manual_schedule_to_min);
+                    scheduleModeNow = Number(hw && hw.vv_manual_schedule_mode);
+
+                    const validFrom = Number.isFinite(scheduleFromMinNow) && scheduleFromMinNow >= 0 && scheduleFromMinNow <= 1440;
+                    const validTo = Number.isFinite(scheduleToMinNow) && scheduleToMinNow >= 0 && scheduleToMinNow <= 1440;
+                    const validMode = Number.isFinite(scheduleModeNow) && scheduleModeNow > 0;
+
+                    if (validFrom && validTo && validMode && scheduleFromMinNow !== scheduleToMinNow) {
+                        scheduleValid = true;
+
+                        if (scheduleFromMinNow < scheduleToMinNow) {
+                            scheduleBlockedNow = (minutesOfDay >= scheduleFromMinNow && minutesOfDay < scheduleToMinNow);
+                        } else {
+                            // korsar midnatt
+                            scheduleBlockedNow = (minutesOfDay >= scheduleFromMinNow || minutesOfDay < scheduleToMinNow);
+                        }
+                    }
+                }
+               // --- Variabler för tidsstyrning (manual schedule) ---
+                let vvManualScheduleActive = false;
+                let vvManualScheduleBlocked = false;
+                let vvManualScheduleBaseline = 20;
+
+
+// --- HW-period vid tidsstyrning ---
+                // Vi håller hw_period=0 när vi vill BLOCKERA VV (t.ex. i block-fönstret).
+                // När vi ska STARTA VV i öppet fönster:
+                //   1) startHW=4 (trigger)
+                //   2) efter 5s: hw_period = baseline (20/25 eller sparat värde)
+                // Baseline hålls kvar tills fönstret stänger, då går vi tillbaka till hw_period=0.
+                let periodJustWritten = false;
+                if (hwPeriodKey) {
+                    let currentPeriod = NaN;
+                    try {
+                        const hwPerRes = await getNibeData(hwPeriodKey).catch(() => undefined);
+                        if (hwPerRes && hwPerRes.data !== undefined && Number.isFinite(Number(hwPerRes.data))) {
+                            currentPeriod = Number(hwPerRes.data);
+                        }
+                    } catch (e) {
+                        currentPeriod = NaN;
+                    }
+
+                    // Om vi ser ett rimligt baseline-värde (>0) och saknar backup: spara det i config.hotwater.
+                    // Detta ger oss ett "original" att falla tillbaka på efter reboot/strömavbrott.
+                    if (Number.isFinite(currentPeriod) && currentPeriod > 0) {
+                        try {
+                            const c = nibe.getConfig() || {};
+                            c.hotwater = c.hotwater || {};
+                            const prev = Number(c.hotwater.vv_backup_hw_period);
+                            if (!Number.isFinite(prev) || prev <= 0) {
+                                c.hotwater.vv_backup_hw_period = currentPeriod;
+                                nibe.setConfig(c);
+                            }
+                        } catch (e) { /* ignore */ }
+
+                        // Om tidsstyrning är aktiverad: spara också baseline för tidsstyrning (persist i config.hotwater)
+                        // (endast första gången, för att undvika onödiga skrivningar).
+                        if (scheduleEnabled) {
+                            try {
+                                const c2 = nibe.getConfig() || {};
+                                c2.hotwater = c2.hotwater || {};
+                                const prev2 = Number(c2.hotwater.vv_backup_hw_period_schedule);
+                                if (!Number.isFinite(prev2) || prev2 <= 0) {
+                                    c2.hotwater.vv_backup_hw_period_schedule = currentPeriod;
+                                    nibe.setConfig(c2);
+                                }
+                            } catch (e) { /* ignore */ }
+                        }
+                    }
+
+                    // Baseline (prioritet: schedule-backup, annars generell backup, annars 20)
+                    let base = NaN;
+                    try {
+                        const c3 = nibe.getConfig() || {};
+                        const hwCfg = c3 && c3.hotwater ? c3.hotwater : {};
+                        base = Number(hwCfg.vv_backup_hw_period_schedule || hwCfg.vv_backup_hw_period);
+                    } catch (e) { base = NaN; }
+                    if (!Number.isFinite(base) || base <= 0) base = 20;
+
+                    vvManualScheduleBaseline = base;
+
+                    const scheduleActive = (scheduleOk && scheduleValid);
+                    vvManualScheduleActive = scheduleActive;
+                    vvManualScheduleBlocked = scheduleBlockedNow;
+
+                    if (!store.meta) store.meta = {};
+                    let armed = (store.meta.vvManualSchedPeriodArmed === true);
+                    const pendingAtRaw = store.meta.vvManualSchedPeriodPendingAt;
+                    const pendingAt = (typeof pendingAtRaw === 'number' && Number.isFinite(pendingAtRaw)) ? pendingAtRaw : NaN;
+                    const hasPending = Number.isFinite(pendingAt);
+
+                    // HW-period:
+                    // - VV-AI/min-temp: vi vill normalt hålla hw_period=0 för att Nibe inte ska planera bakom ryggen.
+                    // - Tidsstyrning: 0 i block-fönster, annars 0 tills vi startar (startHW=4) och 5s efter det släpper vi till baseline.
+                    let desiredPeriod = 0;
+
+                    if (!scheduleActive) {
+                        // ON -> OFF: återställ baseline så Nibe inte lämnas blockerad av tidsstyrningen
+                        if (vvLastManualSchedule) {
+                            desiredPeriod = base;
+                        } else {
+                            desiredPeriod = 0;
+                        }
+                        // reset state
+                        store.meta.vvManualSchedPeriodArmed = false;
+                        delete store.meta.vvManualSchedPeriodPendingAt;
+                        delete store.meta.vvManualSchedPeriodPendingVal;
+                        armed = false;
+                    } else {
+                        if (scheduleBlockedNow) {
+                            desiredPeriod = 0;
+                            store.meta.vvManualSchedPeriodArmed = false;
+                            delete store.meta.vvManualSchedPeriodPendingAt;
+                            delete store.meta.vvManualSchedPeriodPendingVal;
+                            armed = false;
+                        } else {
+                            // öppet fönster
+                            const nowTs2 = Date.now();
+                            if (!armed && hasPending && nowTs2 >= pendingAt) {
+                                desiredPeriod = base;
+                                store.meta.vvManualSchedPeriodArmed = true;
+                                delete store.meta.vvManualSchedPeriodPendingAt;
+                                delete store.meta.vvManualSchedPeriodPendingVal;
+                                armed = true;
+                            } else {
+                                desiredPeriod = armed ? base : 0;
+                            }
+                        }
+                    }
+
+                    // Om vi inte kan läsa nu – anta att period redan är i önskat läge (undvik spam).
+                    if (!Number.isFinite(currentPeriod)) {
+                        currentPeriod = desiredPeriod;
+                    }
+
+                    if (currentPeriod !== desiredPeriod) {
+                        nibe.setData(hwPeriodKey, desiredPeriod);
+                        periodJustWritten = true; // undvik att skriva startHW samma tick om vi precis skrivit period
+                    }
+                    vvLastManualSchedule = scheduleActive;
+                }
+
+
+// --- Styr VV via startHW=4/0 (Tillfällig lyx) + BT7-target ---
+                // Vi triggar startHW=4 när vi vill värma (min-temp / plan), och sätter startHW=0 när BT7 >= target.
+                // Ingen hysteresis: target är alltid det vi räknar fram (min-temp eller stopptemp).
+                if (startHWKey && (aiOk || scheduleOk || minTempEnabled) && !periodJustWritten) {                    // För startHW är det bättre att bara trigga vid förändring (inte spam-skriva).
+                    // Vi håller därför senaste skickade värde i RAM (store.meta) och skriver bara vid byte.
+                    if (!store.meta) store.meta = {};
+                    let lastSentStartHW = Number.isFinite(Number(store.meta.vvStartHWLast)) ? Number(store.meta.vvStartHWLast) : 0;
+
+                    // Stopptemperaturer (för target)
+                    const ecoStop = Number(hw && hw.vv_stop_eco);
+                    const normalStop = Number(hw && hw.vv_stop_normal);
+                    const luxStop = Number(hw && hw.vv_stop_lux);
+
+                    let wantHeat = false;
+                    let wantHeatFromSchedule = false;
+                    let targetTemp = null;
+                    let shouldCloseToday = false;
+
+                    // 1) Min-temp-failsafe (BT7 < vv_ai_min_temp)
+                    // Vi värmer till (minTemp + 4°C), och stoppar exakt när BT7 når target.
+                    let vvMinActive = (store && store.meta && typeof store.meta.vvMinActive === 'boolean') ? store.meta.vvMinActive : false;
+                    let vvMinTarget = (store && store.meta) ? store.meta.vvMinTarget : null;
+                    if (!Number.isFinite(vvMinTarget)) vvMinTarget = null;
+
+                    const minTemp = Number(hw && hw.vv_ai_min_temp);
+                    const margin = 4;
+
+                    if (minTempEnabled && Number.isFinite(bt7Now)) {
+                        if (!vvMinActive && Number.isFinite(minTemp) && bt7Now < minTemp) {
+                            let t = minTemp + margin;
+                            if (Number.isFinite(luxStop) && t > luxStop) t = luxStop;
+                            vvMinTarget = Number.isFinite(t) ? t : null;
+                            vvMinActive = (vvMinTarget !== null);
+                        }
+
+                        if (vvMinActive && vvMinTarget !== null) {
+                            targetTemp = vvMinTarget;
+                            wantHeat = (Number.isFinite(bt7Now) && bt7Now < targetTemp);
+                            if (Number.isFinite(bt7Now) && bt7Now >= targetTemp) {
+                                vvMinActive = false;
+                                vvMinTarget = null;
+                            }
+                        }
+
+                        if (store && store.meta) {
+                            store.meta.vvMinActive = vvMinActive;
+                            store.meta.vvMinTarget = vvMinTarget;
+                        }
+                    }
+
+                    // 2) Tidsstyrning: utanför blockfönster värmer vi till vald stopptemp när BT7 ligger under target
+                    if (!wantHeat && scheduleOk && Number.isFinite(bt7Now)) {
+                        const fromMin = Number(hw && hw.vv_manual_schedule_from_min);
+                        const toMin = Number(hw && hw.vv_manual_schedule_to_min);
+                        const scheduleMode = Number(hw && hw.vv_manual_schedule_mode);
+
+                        const validFrom = Number.isFinite(fromMin) && fromMin >= 0 && fromMin <= 1440;
+                        const validTo = Number.isFinite(toMin) && toMin >= 0 && toMin <= 1440;
+                        const validMode = Number.isFinite(scheduleMode) && scheduleMode > 0;
+
+                        if (validFrom && validTo && validMode && fromMin !== toMin) {
+                            let blocked = false;
+                            if (fromMin < toMin) {
+                                blocked = (minutesOfDay >= fromMin && minutesOfDay < toMin);
+                            } else {
+                                blocked = (minutesOfDay >= fromMin || minutesOfDay < toMin);
+                            }
+
+                            if (!blocked) {
+                                let t = NaN;
+                                if (scheduleMode === 1) t = ecoStop;
+                                else if (scheduleMode === 2) t = normalStop;
+                                else if (scheduleMode === 3) t = luxStop;
+
+                                if (!Number.isFinite(t)) {
+                                    t = Number.isFinite(luxStop) ? luxStop : NaN;
+                                }
+
+                                if (Number.isFinite(t)) {
+                                    targetTemp = t;
+                                    wantHeat = (bt7Now < targetTemp);
+                                    if (wantHeat) wantHeatFromSchedule = true;
+                                }
+                            }
+                        }
+                    }
+                    // Elprisreglering (vv_ai_use_price_enable):
+                    // När prisstyrning är aktiv vill vi INTE låta VV-AI-planen värma "var som helst".
+                    // Plan-värmning (prio 3) får bara ske under de 2 billigaste SAMMANHÄNGANDE timmarna
+                    // inom prisfönstret före dagens peak (baserat på VV-profilen).
+                    // Min-temp (prio 1) och tidsstyrning (prio 2) påverkas inte.
+                    let vvAiCheapHeatAllowedThisHour = true;
+                    if (priceControlEnabled && !manualScheduleEnabled) {
+                        try {
+                            const lookback = Math.max(2, Math.floor(priceWindowHours)); // minst 2h
+                            const baseDay = Math.floor(hourIndex / 24) * 24;
+
+                            // Hitta upp till 2 peaks för dagen (>=3.0) med minst 6h mellan.
+                            // Om inga peaks uppfyller tröskeln, fall back till dagens max-timme.
+                            const PEAK_THR = 3.0;
+                            const MIN_SEP_H = 6;
+
+                            const candidates = [];
+
+                            let maxHourAny = -1;
+
+                            let maxValAny = -Infinity;
+
+                            let maxHourAllowed = -1;
+
+                            let maxValAllowed = -Infinity;
+
+
+                            if (Array.isArray(store.profile) && store.profile.length === 168) {
+
+                                for (let h = 0; h < 24; h++) {
+
+                                    const v = Number(store.profile[baseDay + h]);
+
+                                    if (!Number.isFinite(v)) continue;
+
+
+                                    // Fallback-peak (om inga peaks >= PEAK_THR):
+
+                                    // - ANY: bästa timmen oavsett nattspärr (sista nödfall)
+
+                                    // - ALLOWED: bästa timmen utanför nattspärr (normalt)
+
+                                    if (v > maxValAny) {
+
+                                        maxValAny = v;
+
+                                        maxHourAny = h;
+
+                                    }
+
+                                    if (h >= VV_NIGHT_BLOCK_TO_H && v > maxValAllowed) {
+
+                                        maxValAllowed = v;
+
+                                        maxHourAllowed = h;
+
+                                    }
+
+
+                                    // Peaks: ignorera timmar i nattspärren, annars kan prisfönstret hamna före 00:00 och aldrig matcha planen.
+
+                                    if (v >= PEAK_THR && h >= VV_NIGHT_BLOCK_TO_H) {
+
+                                        candidates.push({ h, v });
+
+                                    }
+
+                                }
+
+                            }
+let peakHours = [];
+                            if (candidates.length > 0) {
+                                candidates.sort((a, b) => b.v - a.v);
+                                for (const c of candidates) {
+                                    if (peakHours.length === 0) {
+                                        peakHours.push(c.h);
+                                    } else if (Math.abs(c.h - peakHours[0]) >= MIN_SEP_H) {
+                                        peakHours.push(c.h);
+                                    }
+                                    if (peakHours.length >= 2) break;
+                                }
+                            }
+                            if (peakHours.length === 0) {
+                                const fallbackHour = (maxHourAllowed >= 0) ? maxHourAllowed : maxHourAny;
+                                if (fallbackHour >= 0) {
+                                    peakHours = [fallbackHour];
+                                }
+                            }
+
+                            // Om vi saknar peak (ovanligt), tillåt plan-värmning som fallback
+                            if (!Array.isArray(peakHours) || peakHours.length === 0) {
+                                vvAiCheapHeatAllowedThisHour = true;
+                            } else {
+                                // Tillåt plan-värmning om timmen ingår i någon av dagens 2h-block (en per peak),
+                                // med fallback: om blocket redan passerat tillåt sista 2h före respektive peak.
+                                let allowed = false;
+
+                                for (const peakHour of peakHours) {
+                                    // Sök i [peakHour-lookback, peakHour) alltså timmarna före peak-timmen
+                                    const windowStart = baseDay + Math.max(0, peakHour - lookback);
+                                    const windowEndExclusive = baseDay + Math.max(2, peakHour); // måste ha minst 2h
+
+                                    let bestStart = null;
+                                    let bestSum = Infinity;
+
+                                    // 2h-par måste sluta innan peakHour (dvs start <= peakHour-2)
+                                    const lastStart = baseDay + Math.min(peakHour - 2, 22);
+                                    if (lastStart < windowStart) {
+                                        continue;
+                                    }
+
+                                    for (let i = windowStart; i <= lastStart; i++) {
+                                        const i2 = i + 1;
+
+                                        // Vi tillåter bara par som faktiskt ligger i VV-planen (mode/temp > 0)
+                                        const m1 = (store.modePlan && Number(store.modePlan[i])) || 0;
+                                        const m2 = (store.modePlan && Number(store.modePlan[i2])) || 0;
+                                        const t1 = (store.tempPlan && Number(store.tempPlan[i])) || 0;
+                                        const t2 = (store.tempPlan && Number(store.tempPlan[i2])) || 0;
+                                        if (m1 <= 0 || m2 <= 0 || t1 <= 0 || t2 <= 0) continue;
+
+                                        const p1 = Number(priceByIndex[i]);
+                                        const p2 = Number(priceByIndex[i2]);
+                                        if (!Number.isFinite(p1) || !Number.isFinite(p2)) continue;
+
+                                        const sum = p1 + p2;
+
+                                        // Tie-break: om lika billigt, välj den som ligger SENARE (närmast peak)
+                                        if (sum < bestSum || (sum === bestSum && (bestStart === null || i > bestStart))) {
+                                            bestSum = sum;
+                                            bestStart = i;
+                                        }
+                                    }
+
+                                    // Om vi inte kan beräkna billigast (saknar pris), tillåt fallback
+                                    if (bestStart === null) {
+                                        allowed = true;
+                                        continue;
+                                    }
+
+                                    const cheapAllowed = (hourIndex === bestStart || hourIndex === bestStart + 1);
+
+                                    const peakAbs = baseDay + peakHour;
+                                    const fallbackStart = peakAbs - 2; // 2h före peak
+                                    const fallbackAllowed = (hourIndex === fallbackStart || hourIndex === fallbackStart + 1)
+                                        && hourIndex > (bestStart + 1) // billigaste blocket passerat
+                                        && hourIndex < peakAbs;        // inte efter peak-start
+
+                                    if (cheapAllowed || fallbackAllowed) {
+                                        allowed = true;
+                                    }
+                                }
+
+                                vvAiCheapHeatAllowedThisHour = allowed;
+                            }
+} catch (e) {
+                            vvAiCheapHeatAllowedThisHour = true; // safe fallback
+                        }
+                    }
+
+                    // 3) VV-AI-veckoplan (en "klump" per dag, dagstängning via store.meta.hwClosedDate)
+                    if (!wantHeat && aiOk && Number.isFinite(bt7Now) && planMode > 0 && planTemp !== null && (!priceControlEnabled || vvAiCheapHeatAllowedThisHour)) {
+                        const currentClosedDate = (store && store.meta && typeof store.meta.hwClosedDate === 'string')
+                            ? store.meta.hwClosedDate
+                            : null;
+                                                const closedUntilIdx = (store && store.meta && Number.isFinite(store.meta.hwClosedUntilIdx))
+                            ? store.meta.hwClosedUntilIdx
+                            : -1;
+
+                        // Om dag bytts sedan vi stängde en klump – nollställ index.
+                        if (store && store.meta && currentClosedDate !== todayStr && store.meta.hwClosedUntilIdx !== -1) {
+                            store.meta.hwClosedUntilIdx = -1;
+                        }
+
+                        const closedToday = (currentClosedDate === todayStr) && (hourIndex <= closedUntilIdx);
+
+                        if (!closedToday) {
+                            targetTemp = planTemp;
+                            wantHeat = (bt7Now < targetTemp);
+
+                                                        // Om vi redan är över target: stäng nuvarande "klump" (block) för idag,
+                            // men tillåt senare uppvärmning samma dag om det finns en ny klump (t.ex. 2 peaks).
+                            if (bt7Now >= targetTemp) {
+                                let endIdx = hourIndex;
+                                try {
+                                    const hourInDay = nowLocal.getHours();
+                                    const dayStartIdx = hourIndex - hourInDay;
+                                    const endLimit = dayStartIdx + 23;
+                                    while (endIdx < endLimit && store && Array.isArray(store.tempPlan) &&
+                                           Number.isFinite(store.tempPlan[endIdx + 1]) && store.tempPlan[endIdx + 1] > 0) {
+                                        endIdx++;
+                                    }
+                                } catch (e) {
+                                    // ignore
+                                }
+
+                                if (store && store.meta) {
+                                    store.meta.hwClosedDate = todayStr;
+                                    store.meta.hwClosedUntilIdx = endIdx;
+                                }
+                                wantHeat = false;
+                            }
+                        }
+                    }
+
+                    // Rate-limit skrivningar till startHW (minst ~1s mellan)
+                    const nowTs = Date.now();
+                    const lastWrite = (store && store.meta && Number.isFinite(store.meta.lastStartHWWriteTs))
+                        ? store.meta.lastStartHWWriteTs
+                        : 0;
+                    const canWrite = (nowTs - lastWrite) >= 1100;
+
+                    if (wantHeat) {
+                        if (canWrite && lastSentStartHW !== 4) {
+                            nibe.setData(startHWKey, 4); // Tillfällig lyx (trigger) = starta VV
+                            if (store && store.meta) {
+                                store.meta.lastStartHWWriteTs = nowTs;
+                                store.meta.vvStartHWLast = 4;
+                            }
+
+                            // Tidsstyrning: efter startHW=4, vänta 5s och släpp hw_period till baseline (om vi inte redan gjort det)
+                            if (wantHeatFromSchedule && vvManualScheduleActive && !vvManualScheduleBlocked && store && store.meta) {
+                                const armed = (store.meta.vvManualSchedPeriodArmed === true);
+                                const pendingRaw = store.meta.vvManualSchedPeriodPendingAt;
+                                const pending = (typeof pendingRaw === 'number' && Number.isFinite(pendingRaw)) ? pendingRaw : NaN;
+                                if (!armed && !Number.isFinite(pending)) {
+                                    store.meta.vvManualSchedPeriodPendingAt = Date.now() + 5000;
+                                    store.meta.vvManualSchedPeriodPendingVal = vvManualScheduleBaseline;
+                                }
+                            }
+                        }
+                    } else {
+                        if (canWrite && lastSentStartHW !== 0) {
+                            nibe.setData(startHWKey, 0); // stoppa/återställ till normal
+                            if (store && store.meta) {
+                                store.meta.lastStartHWWriteTs = nowTs;
+                                store.meta.vvStartHWLast = 0;
+                            }
+                        }
+                    }
+
+                    if (shouldCloseToday && store && store.meta) {
+                        store.meta.hwClosedDate = todayStr;
+                    }
+                }
+            } catch (e) {
+                nibe.log(`VV-AI: fel vid hw_period/startHW-styrning: ${e}`, 'hotwater', 'error');
+            }
+
+vvLastAiControl = (hw.enable_vv_ai_control === true);
+
+            if (Number.isFinite(bt7Now) && planTemp !== null) {
+            }
+
+            store.meta.lastBt6 = bt6Now;
+            store.meta.lastBt7 = bt7Now;
+
+            // Uppdatera senaste VV-AI tick-tid
+            store.meta.lastTick = ts;
+
+            // Skicka graf till pluginHotwaterAI varje minut (ingen throttle)
+            const graph = hotwaterAiBuildGraph(store, hw);
+            if (graph) {
+                graph.bt6 = Number.isFinite(bt6Now) ? bt6Now : null;
+                graph.bt7 = Number.isFinite(bt7Now) ? bt7Now : null;
+                graph.timestamp = ts;
+                graph.hourIndex = hourIndex;
+                nibeData.emit('pluginHotwaterAI', graph);
+            }
+
+            if (learningEnabled) {
+                saveVvAiStore();
+            }
+
+        } catch (err) {
+            nibe.log(`VV-AI tick error: ${err}`, 'hotwater', 'error');
+        }
+    }
     const SunCalc = require('suncalc');
     const suncalc = (data) => {
         var times = SunCalc.getTimes(data.timestamp, data.lat, data.lon);
@@ -132,7 +1982,7 @@ module.exports = function(RED) {
                                     }
                                 }
                             }).catch(console.log)
-                                
+
                         }, 5000,i);
                     }
                 }
@@ -161,11 +2011,11 @@ module.exports = function(RED) {
                                 }
                             }
                         }
-                        
+
                     }
                 }
             }
-            
+
             resolve(true);
         });
         return promise;
@@ -175,13 +2025,13 @@ module.exports = function(RED) {
         const promise = new Promise((resolve,reject) => {
             clearList(plugin,system).then(result => {
                 var newSystem = true;
-                
+
                 for( var i = 0; i < arr.length; i++){
                     if(arr[i].register===undefined) {
                         arr[i].register = hP[arr[i].topic];
                     }
                     for( var o = 0; o < getList.length; o++){
-                        
+
                         if(getList[o].system===system) {
                             // System exists, moving on.
                             newSystem = false;
@@ -204,7 +2054,7 @@ module.exports = function(RED) {
 
                                     }
                                 }
-                            
+
                         }
                     }
                 }
@@ -235,7 +2085,7 @@ module.exports = function(RED) {
                                 }
                                 resolve(true)
                             } else {
-                                return reject(false); 
+                                return reject(false);
                             }
                         }).catch((err) => {
                             return reject(false)
@@ -324,13 +2174,13 @@ module.exports = function(RED) {
                                 }
                                 resolve(true)
                             }
-                                
+
                             }
                         }).catch((err) => {
                             checkRMU();
                             return reject(false);
                         });
-                        
+
                     } else {
                         checkRMU();
                         nibe.reqData(checkReg).then(data => {
@@ -357,7 +2207,7 @@ module.exports = function(RED) {
                             checkRMU();
                             return reject(false);
                         });
-                        
+
                     }
                 } else {
                     checkRMU();
@@ -372,7 +2222,7 @@ module.exports = function(RED) {
                                     if(data.data<-3276) {
                                         return reject(false);
                                     } else {
-    
+
                                     }
                                 },(error => {
                                     return reject(false);
@@ -385,7 +2235,7 @@ module.exports = function(RED) {
                         checkRMU();
                         return reject(false);
                     });
-                    
+
                 }
         })
     });
@@ -439,7 +2289,7 @@ module.exports = function(RED) {
                                 result[item.registers[i].register] = data;
                                 array.push(data)
                             }
-                            
+
                         },(error => {
                             sendError(text.extra_sensor,`${text.extra_sensor} ${item.registers[i].name} ${text.no_values}`)
                         }));
@@ -480,7 +2330,7 @@ module.exports = function(RED) {
             nibe.setConfig(config);
         }
           if(config.weather.wind_enable!==undefined && config.weather.wind_enable===true) {
-            
+
             var wind_speed_arr = [];
             var wind_gust_arr = [];
             var temp_arr = [];
@@ -709,7 +2559,7 @@ module.exports = function(RED) {
                             saveDataGraph('weather_offset_'+val.system,timeNow,0,true);
                         }
                     });
-                
+
                 }).on("error", (err) => {
                     nibe.log(err.message,'weather','error');
                 });
@@ -731,7 +2581,7 @@ module.exports = function(RED) {
             }
             saveDataGraph('weather_offset_'+val.system,timeNow,0,true);
         }
-        
+
     }
     const indoorArray = [];
     const runIndoor = (data,array) => {
@@ -832,8 +2682,12 @@ module.exports = function(RED) {
         let inside = data.priceSensor;
         nibe.log(`Startar elprisjustering priceAdjustCurve() för ${data.system}`,'price','debug');
         let config = nibe.getConfig();
-        
-        if(config.price===undefined) {
+
+
+            // Defaults for VAT and AI display surcharge (in öre).
+            if (config.price.vat === undefined) { config.price.vat = 0.25; }
+            if (config.price.addition_ore === undefined) { config.price.addition_ore = 88.01; } // you can change this in config
+if(config.price===undefined) {
             config.price = {};
             nibe.setConfig(config);
         }
@@ -855,14 +2709,14 @@ module.exports = function(RED) {
                     if(hw_enable!==undefined && hw_enable===true) {
                         hw_adjust = Number(config.price.hotwater_very_cheap);
                     }
-           
-                    
+
+
                 } else if(hw_level=="CHEAP") {
                     nibe.log(`Nivån är billig`,'price','debug');
                     if(hw_enable!==undefined && hw_enable===true) {
                         hw_adjust = Number(config.price.hotwater_cheap);
                     }
-                    
+
                 } else if(hw_level=="NORMAL") {
                     nibe.log(`Nivån är normal`,'price','debug');
                     if(hw_enable!==undefined && hw_enable===true) {
@@ -887,21 +2741,21 @@ module.exports = function(RED) {
                 }
             } else {
                 sendError('Elprisreglering',`Kunde ej hämta prisnivå från värmepumpen eller funktion avstängd.`);
-                
-                
+
+
             }
             // Justera värme
             if(heat_level!==undefined && heat_level!==0) {
                 let temp_diff = config.price['temp_low_'+system];
                 let heat_adjust = 0;
-                
+
                 nibe.log(`Värme: ${heat_enable}`,'price','debug');
                 if(data['inside_set_'+system]!==undefined) {
                     nibe.log(`Lägsta inomhustemperatur: ${data['inside_set_'+system].data+temp_diff} grader`,'price','debug');
                 }
                 if(heat_level=="VERY_CHEAP") {
                     nibe.log(`Nivån är väldigt billig`,'price','debug');
-    
+
                     if(heat_enable!==undefined && heat_enable===true) if(config.price['heat_very_cheap_'+system]!==undefined) heat_adjust = config.price['heat_very_cheap_'+system];
                 } else if(heat_level=="CHEAP") {
                     nibe.log(`Nivån är billig`,'price','debug');
@@ -944,7 +2798,7 @@ module.exports = function(RED) {
                         nibe.log(`Värmepump stödjer inte stopp via gradminuter`,'price','debug');
                     })
                 }
-                
+
                 priceOffset[system] = heat_adjust;
                 curveAdjust('price',system,heat_adjust);
             } else {
@@ -953,24 +2807,34 @@ module.exports = function(RED) {
                     priceOffset[system] = 0;
                     curveAdjust('price',system,0);
                 }
-                
+
             }
         } else {
-            let level = data.price_level.data;
+
+// PATCH: robust price level lookup (supports price_level, heat_price_level, priceai.heat)
+let level = null;
+try {
+  level = (data && data.heat_price_level && data.heat_price_level.data) ||
+          (data && data.price_level && data.price_level.data) ||
+          (data && data.priceai && data.priceai.heat && data.priceai.heat.level) ||
+          null;
+} catch(e) { level = null; }
+if (typeof level === "string" && /^-?\d+(\.\d+)?$/.test(level)) level = Number(level);
+
             if(level!==undefined && level!==0) {
                 let hw_enable = config.price.hotwater_enable;
                 let heat_enable = config.price['enable_heat_'+system];
                 let temp_diff = config.price['temp_low_'+system];
                 let hw_adjust;
                 let heat_adjust = 0;
-                
+
                 nibe.log(`Varmvatten: ${hw_enable}, Värme: ${heat_enable}`,'price','debug');
                 if(data['inside_set_'+system]!==undefined) {
                     nibe.log(`Lägsta inomhustemperatur: ${data['inside_set_'+system].data+temp_diff} grader`,'price','debug');
                 }
                 if(level=="VERY_CHEAP") {
                     nibe.log(`Nivån är väldigt billig`,'price','debug');
-    
+
                     if(hw_enable!==undefined && hw_enable===true) hw_adjust = Number(config.price.hotwater_very_cheap);
                     if(heat_enable!==undefined && heat_enable===true) {
                         if(config.price['heat_very_cheap_'+system]!==undefined) heat_adjust = config.price['heat_very_cheap_'+system];
@@ -983,7 +2847,7 @@ module.exports = function(RED) {
                                     nibe.log(`Ställer in gradminuter nära start ${data.dMstart.data+25}`,'price','debug');
                                     nibe.setData(hP['dM'],(data.dMstart.data+25));
                                 }
-                                
+
                             }
                         }
                     }
@@ -1009,7 +2873,7 @@ module.exports = function(RED) {
                     if(hw_enable!==undefined && hw_enable===true) hw_adjust = Number(config.price.hotwater_normal);
                     if(config.price['heat_normal_'+system]!==undefined) heat_adjust = config.price['heat_normal_'+system];
                 } else if(level=="EXPENSIVE") {
-                    
+
                     nibe.log(`Nivån är dyr`,'price','debug');
                     if(hw_enable!==undefined && hw_enable===true) hw_adjust = Number(config.price.hotwater_expensive);
                     if(inside!==undefined && (inside.data>(data['inside_set_'+system].data+temp_diff)) || config.price['enable_temp_'+system]===undefined || config.price['enable_temp_'+system]===false) {
@@ -1036,7 +2900,7 @@ module.exports = function(RED) {
                     }).catch(async err => {
                         nibe.log(err,'price','debug');
                         blockAdditive({heat:heat_adjust}).then(result => {
-                        
+
                         }).catch(async err => {
                             nibe.log(`Värmepump stödjer inte stopp via gradminuter`,'price','debug');
                         })
@@ -1064,17 +2928,17 @@ module.exports = function(RED) {
                     }).catch(async err => {
                         nibe.log(err,'price','debug');
                         blockAdditive({heat:0}).then(result => {
-                        
+
                         }).catch(async err => {
                             nibe.log(`Värmepump stödjer inte stopp via gradminuter`,'price','debug');
                         })
                     })
                     curveAdjust('price',system,0);
                 }
-                
+
             }
         }
-        
+
     }
     let nibeGraph = [];
     let nibeGraphAdjust = [];
@@ -1112,7 +2976,7 @@ module.exports = function(RED) {
             let result = {values:[],system:system};
             return result;
         }
-        
+
     }
     function priceBuildPoolGraph(prices,system) {
         let config = nibe.getConfig();
@@ -1128,13 +2992,14 @@ module.exports = function(RED) {
         for( var o = 0; o < priceArray.length; o++){
             let timestamp = priceArray[o].ts
             var adjust = 0;
-            let value = Number((priceArray[o].value/100).toFixed(2));
+            let baseKr = (priceArray[o].value/100);
+            let value = Number(((baseKr*(1+((config.price&&typeof config.price.vat==="number")?config.price.vat:0.25))) + (((config.price&&typeof config.price.addition_ore==="number")?config.price.addition_ore:88.01)/100)).toFixed(2));
             if(config.price[`${priceArray[o].level}_POOL_HEAT`]!==undefined) {
                 adjust = config.price[`${priceArray[o].level}_POOL_HEAT`]
             }
             valueArray.push({x:timestamp,y:Number(value)});
             adjustArray.push({x:timestamp,y:Number(adjust.toFixed(2))})
-            
+
         }
         valueArray.sort((a, b) => (a.x > b.x) ? 1 : -1)
         adjustArray.sort((a, b) => (a.x > b.x) ? 1 : -1)
@@ -1151,7 +3016,12 @@ module.exports = function(RED) {
     function priceaiBuildGraph(heat,hw,data,prio_add_enable) {
         var system = data.system
         let config = nibe.getConfig();
-        if(config.price===undefined) {
+
+        // Apply VAT and AI-only markup (öre) to chart values (shown in SEK). Tibber graph stays unchanged.
+        const vatRate = (config.price && typeof config.price.vat === "number") ? config.price.vat : 0.25;
+        const additionOre = (config.price && typeof config.price.addition_ore === "number") ? config.price.addition_ore : 88.01;
+
+if(config.price===undefined) {
             config.price = {};
             nibe.setConfig(config);
         }
@@ -1168,7 +3038,10 @@ module.exports = function(RED) {
             let timestamp = priceArrayHeat[o].ts
             var adjust = 0;
             let hotwater_adjust = Number(config.price.hotwater_normal);
-            let value = Number((priceArrayHeat[o].value/100).toFixed(2));
+            let baseKr = (priceArrayHeat[o].value/100);
+            const __own = !!(config && config.price && config.price.enable_own_price);
+const __applyVat = !!(config && config.price && config.price.apply_vat === true);
+let value = Number((__own ? (baseKr * (__applyVat ? (1 + vatRate) : 1) + (additionOre/100)) : baseKr).toFixed(2));
             if(priceArrayHeat[o].level=="VERY_CHEAP") {
                 hotwater_adjust = Number(config.price.hotwater_very_cheap);
                 if(heat_enable!==undefined && heat_enable===true) adjust = config.price['heat_very_cheap_'+system]||0;
@@ -1187,7 +3060,7 @@ module.exports = function(RED) {
             }
             valueArray.push({x:timestamp,y:Number(value)});
             adjustArrayHeat.push({x:timestamp,y:Number(adjust.toFixed(2))})
-            
+
         }
         for( var o = 0; o < priceArrayHW.length; o++){
             let timestamp = priceArrayHW[o].ts
@@ -1204,7 +3077,7 @@ module.exports = function(RED) {
                 hotwater_adjust = Number(config.price.hotwater_very_expensive);
             }
             adjustArrayHW.push({x:timestamp,y:Number(hotwater_adjust.toFixed(2))})
-            
+
         }
         valueArray.sort((a, b) => (a.x > b.x) ? 1 : -1)
         adjustArrayHeat.sort((a, b) => (a.x > b.x) ? 1 : -1)
@@ -1291,7 +3164,7 @@ module.exports = function(RED) {
             }
             valueArray.push({x:timestamp,y:Number(value)});
             adjustArray.push({x:timestamp,y:Number(adjust.toFixed(2))})
-            
+
         }
         valueArray.sort((a, b) => (a.x > b.x) ? 1 : -1)
         adjustArray.sort((a, b) => (a.x > b.x) ? 1 : -1)
@@ -1305,8 +3178,700 @@ module.exports = function(RED) {
         let result = {values:sendArray,system:system};
         return result;
     }
-    async function runPrice(data,array) {
-        
+
+///////##########################################################
+// ##################################################################
+// # START: Algoritm från energy.anerdins-iot.se (ORIGINAL-LOGIK)   #
+// ##################################################################
+
+function findTradingOpportunities(sortedPrices, originalData, config) {
+    const opportunities = [];
+
+    // ##################################################################
+    // # START: KORRIGERING FÖR FLEXIBEL UPPLÖSNING                     #
+    // ##################################################################
+    let slotsInWindow = config.timeWindow; // Standardvärde ifall något går fel
+
+    // Beräkna hur många minuter varje datapunkt representerar (60 för timme, 15 för kvart)
+    if (originalData.length > 1) {
+        const slotDurationMinutes = (originalData[1].ts - originalData[0].ts) / 60000;
+        if (slotDurationMinutes > 0) {
+            // Beräkna hur många "slots" som ryms i den angivna tidshorisonten i timmar
+            slotsInWindow = Math.round((config.timeWindow * 60) / slotDurationMinutes);
+        }
+    }
+    nibe.log(`[DEBUG Algorithm] Tidshorisont är ${config.timeWindow} timmar, vilket motsvarar ${slotsInWindow} datapunkter.`, 'price', 'debug');
+    // ##################################################################
+    // # SLUT: KORRIGERING                                              #
+    // ##################################################################
+
+    for (const lowPoint of sortedPrices) {
+        let buyIndex = -1;
+        for (let j = 0; j < originalData.length; j++) {
+            if (lowPoint.ts === originalData[j].ts) {
+                buyIndex = j;
+                break;
+            }
+        }
+
+        if (buyIndex === -1) continue;
+
+         // Använder den nya, korrekt beräknade tidshorisonten
+        const endIndex = Math.min(buyIndex + slotsInWindow, originalData.length);
+
+
+        for (let sellIndex = buyIndex + 1; sellIndex < endIndex; sellIndex++) {
+            const spread = originalData[sellIndex].value - lowPoint.value;
+
+            if (spread > config.minSpread) {
+                opportunities.push({
+                    buy: lowPoint,
+                    sell: originalData[sellIndex],
+                    spread: spread
+                });
+            }
+        }
+    }
+    const sortedOpportunities = opportunities.sort((a, b) => b.spread - a.spread);
+    if (sortedOpportunities.length > 0) {
+        nibe.log(`[DEBUG] Bästa funna affär: Köp för ${sortedOpportunities[0].buy.value.toFixed(2)} öre, Sälj för ${sortedOpportunities[0].sell.value.toFixed(2)} öre, Spread: ${sortedOpportunities[0].spread.toFixed(2)} öre`, 'price', 'debug');
+    }
+    return sortedOpportunities;
+}
+
+/**
+ * Hittar den optimala kombinationen av handelsmöjligheter (ORIGINAL-VERSION)
+ * @private
+ */
+function findOptimalCombination(opportunities) {
+    if (opportunities.length === 0) return [];
+
+    const combinations = [];
+
+    // För varje möjlighet, bygg en kombination av icke-överlappande handel
+    for (let i = 0; i < opportunities.length; i++) {
+        const combination = [opportunities[i]];
+
+        for (let j = 0; j < opportunities.length; j++) {
+            if (i === j) continue;
+
+            // Kontrollerar om en affär överlappar med någon i den nuvarande kombinationen
+            const hasConflict = combination.some(trade =>
+                trade.buy.ts === opportunities[j].buy.ts ||
+                trade.sell.ts === opportunities[j].sell.ts ||
+                trade.buy.ts === opportunities[j].sell.ts ||
+                trade.sell.ts === opportunities[j].buy.ts
+            );
+
+            if (!hasConflict) {
+                combination.push(opportunities[j]);
+            }
+        }
+
+        const totalProfit = combination.reduce((sum, trade) => sum + trade.spread, 0);
+        combinations.push({
+            trades: combination,
+            totalProfit: totalProfit
+        });
+    }
+
+    // Returnera kombinationen med högst total profit
+    combinations.sort((a, b) => b.totalProfit - a.totalProfit);
+    //return combinations[0]?.trades || [];
+    // KORRIGERING: Ersätter "combinations[0]?.trades" med en säkrare variant.
+    return combinations.length > 0 ? combinations[0].trades : [];
+}
+
+
+function formatResult(optimalTrades) {
+    const buyPoints = [];
+    const sellPoints = [];
+
+    for (const trade of optimalTrades) {
+        buyPoints.push(trade.buy);
+        sellPoints.push(trade.sell);
+    }
+
+    return {
+        buy: buyPoints,
+        sell: sellPoints
+    };
+}
+
+function optimizeElectricityTrading(priceData, options = {}) {
+    if (!Array.isArray(priceData) || priceData.length === 0) {
+        return { buy: [], sell: [] };
+    }
+
+    const config = {
+        timeWindow: Number(options.timeWindow) || 12,
+        // KORRIGERAD: Använder 20 (ören) som standard, enligt originalet.
+        minSpread: Number(options.minSpread) || 20
+    };
+
+    const sortedByPrice = [...priceData].sort((a, b) => a.value - b.value);
+    const totalSpread = sortedByPrice[sortedByPrice.length - 1].value - sortedByPrice[0].value;
+
+    if (totalSpread <= config.minSpread) {
+        return { buy: [], sell: [] };
+    }
+
+    const tradingOpportunities = findTradingOpportunities(
+        sortedByPrice,
+        priceData,
+        config
+    );
+
+    if (tradingOpportunities.length === 0) {
+        return { buy: [], sell: [] };
+    }
+
+    const optimalCombination = findOptimalCombination(tradingOpportunities);
+    return formatResult(optimalCombination);
+}
+
+// ##################################################################
+// # SLUT: Algoritm                                                 #
+// ##################################################################
+
+// runPrice, nu med 15-min stöd. Priset för 4 kvartar räknas om till medelvärde för en timme.
+async function runPrice(data,array) {
+
+    nibe.log(`Startar elprisreglering runPrice()`,'price','debug');
+    let config = nibe.getConfig();
+    let inside;
+    nibe.log(`Letar efter givare ${config.price['sensor_'+data.system]}`,'price','debug');
+    if(config.price['sensor_'+data.system]!==undefined && config.price['sensor_'+data.system]!=="") {
+        let index = array.findIndex(i => i.name == config.price['sensor_'+data.system]);
+        if(index!==-1) {
+            inside = array[index];
+            nibe.log(`Sätter inomhusgivare ${config.price['sensor_'+data.system]}, ${inside.data} grader`,'price','debug');
+        }
+    }
+    data.priceSensor = inside;
+    if(config.price!==undefined && config.price.enable===true) {
+        nibe.log(`Elprisreglering är aktiverad`,'price','debug');
+        if(config.price.source=="tibber") {
+            nibe.log(`Källan är Lokal AI via Tibber`,'price','debug');
+
+            if(config.price.token === undefined || config.price.token === "") {
+                sendError('Lokal AI',`Tibber Token krävs för att hämta prisdata.`);
+                return;
+            }
+
+            try {
+                const tibberToken = config.price.token;
+                const tibberOptions = {
+                    hostname: 'api.tibber.com',
+                    port: 443,
+                    path: '/v1-beta/gql',
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${tibberToken}`, 'Content-Type': 'application/json' }
+                };
+
+                const tibberRequest = JSON.stringify({
+                    query: "{\
+                        viewer {\
+                            homes {\
+                            currentSubscription {\
+                                priceInfo(resolution: QUARTER_HOURLY) {\
+                                today{\
+                                    startsAt\
+                                    total\
+                                }\
+                                tomorrow {\
+                                    startsAt\
+                                    total\
+                                }\
+                                }\
+                            }\
+                            }\
+                        }\
+                        }"
+                });
+
+                const priceResult = await getCloudData(tibberOptions, tibberRequest);
+                if (!priceResult || !priceResult.data || !priceResult.data.viewer) {
+                    nibe.log(`Tibber API returnerade ett fel eller ingen data. Svar: ${JSON.stringify(priceResult)}`, 'price', 'error');
+                    sendError('Lokal AI', 'Kunde inte hämta prisdata från Tibber. Kontrollera token och abonnemang.');
+                    return;
+                }
+
+                const priceInfo = priceResult.data.viewer.homes[config.price.tibber_home || 0].currentSubscription.priceInfo;
+
+                const quarterlyPriceList = (priceInfo.today || []).concat(priceInfo.tomorrow || []);
+                if (quarterlyPriceList.length === 0) {
+                    nibe.log('Ingen prisdata alls tillgänglig.', 'price', 'warn');
+                    return;
+                }
+                // ##################################################################
+                // # START: Logik för att konvertera kvartspriser till timpriser    #
+                // ##################################################################
+                const hourlyPriceList = [];
+                const groupedByHour = quarterlyPriceList.reduce((acc, price) => {
+                    const hour = price.startsAt.substring(0, 13); // "2025-09-30T10"
+                    if (!acc[hour]) {
+                        acc[hour] = [];
+                    }
+                    acc[hour].push(price.total);
+                    return acc;
+                }, {});
+                // Hämta offset för serverns tid (t.ex. ger -60 minuter för UTC+1)
+                const offset = -new Date().getTimezoneOffset();
+                const sign = offset >= 0 ? '+' : '-';
+                const pad = num => String(Math.abs(num)).padStart(2, '0');
+                const hoursOffset = Math.floor(Math.abs(offset) / 60);
+                const minsOffset = Math.abs(offset) % 60;
+                const timezoneString = `${sign}${pad(hoursOffset)}:${pad(minsOffset)}`;
+
+
+
+                for (const hour in groupedByHour) {
+                    const pricesInHour = groupedByHour[hour];
+                    const averagePrice = pricesInHour.reduce((sum, p) => sum + p, 0) / pricesInHour.length;
+                    hourlyPriceList.push({
+                        startsAt: `${hour}:00:00.000${timezoneString}`,
+                        total: averagePrice
+                    });
+                }
+                nibe.log(`Hämtade ${quarterlyPriceList.length} kvartspunkter och konverterade till ${hourlyPriceList.length} stabila timpunkter.`, 'price', 'debug');
+                const fullPriceList = hourlyPriceList;
+                // VV-AI: cacha timpriser i RAM för VV-analys (ingen SD-skrivning)
+                vvAiPriceCache = fullPriceList;
+                // ##################################################################
+                // # SLUT PÅ KONVERTERING                                           #
+                // ##################################################################
+
+
+                 nibe.log(`Hämtade ${fullPriceList.length} kvartspunkter för analys.`, 'price', 'debug');
+
+
+                const now = new Date();
+                now.setMinutes(0, 0, 0);
+                const futurePriceList = fullPriceList.filter(p => p && p.startsAt && (new Date(p.startsAt) >= now));
+                if (futurePriceList.length === 0) {
+                    nibe.log('Ingen framtida prisdata tillgänglig.', 'price', 'warn');
+                    return;
+                }
+                const currentHour = futurePriceList[0];
+                const currentHourDate = currentHour.startsAt;
+
+                const priceDataForAlgo = fullPriceList.map(p => ({
+                    value: p.total * 100, // ÖREN
+                    ts: new Date(p.startsAt).getTime(),
+                    date: p.startsAt
+                }));
+
+                const algoOptions = {
+                    timeWindow: config.price.time,
+                    minSpread: config.price.min_spread
+                };
+                const optimalTrades = optimizeElectricityTrading(priceDataForAlgo, algoOptions);
+
+                let currentLevel = 'NORMAL';
+                let veryCheapHours, cheapHours, expensiveHours, veryExpensiveHours;
+
+                if (optimalTrades.buy.length > 0) {
+                    const buyPrices = optimalTrades.buy.sort((a, b) => a.value - b.value);
+                    const sellPrices = optimalTrades.sell.sort((a, b) => a.value - b.value);
+                    const buyMedianIndex = Math.floor(buyPrices.length / 2);
+                    const sellMedianIndex = Math.floor(sellPrices.length / 2);
+
+                    veryCheapHours = new Set(buyPrices.slice(0, buyMedianIndex).map(p => p.date));
+                    cheapHours = new Set(buyPrices.slice(buyMedianIndex).map(p => p.date));
+                    expensiveHours = new Set(sellPrices.slice(0, sellMedianIndex).map(p => p.date));
+                    veryExpensiveHours = new Set(sellPrices.slice(sellMedianIndex).map(p => p.date));
+
+                    if (veryCheapHours.has(currentHourDate)) currentLevel = 'VERY_CHEAP';
+                    else if (cheapHours.has(currentHourDate)) currentLevel = 'CHEAP';
+                    else if (veryExpensiveHours.has(currentHourDate)) currentLevel = 'VERY_EXPENSIVE';
+                    else if (expensiveHours.has(currentHourDate)) currentLevel = 'EXPENSIVE';
+                }
+
+                const heat = {
+                    level: currentLevel,
+                    current: currentHour.total * 100,
+                    prices: fullPriceList.map(p => {
+                        const date = p.startsAt;
+                        let hourLevel = 'NORMAL';
+                        if (veryCheapHours && veryCheapHours.has(date)) hourLevel = 'VERY_CHEAP';
+                        else if (cheapHours && cheapHours.has(date)) hourLevel = 'CHEAP';
+                        else if (veryExpensiveHours && veryExpensiveHours.has(date)) hourLevel = 'VERY_EXPENSIVE';
+                        else if (expensiveHours && expensiveHours.has(date)) hourLevel = 'EXPENSIVE';
+
+                        return { value: p.total * 100, level: hourLevel, ts: new Date(p.startsAt).getTime() };
+                    })
+                };
+
+                const hw = { ...heat };
+                data.priceai = { heat, hw };
+                data.price_current = {
+  data: (function(){
+    var __own = !!(config && config.price && config.price.enable_own_price);
+    var __applyVat = !!(config && config.price && config.price.apply_vat === true);
+    var __vat = (typeof config.price.vat === 'number' ? config.price.vat : 0.25);
+    var __addOre = ((config && config.price && config.price.addition_ore) || 0);
+    var __baseKr = (Number(heat.current) || 0) / 100;
+    var __showKr = __own ? (__baseKr * (__applyVat ? (1 + __vat) : 1) + (__addOre/100)) : __baseKr;
+    return Number((__showKr * 100).toFixed(2));
+  })(),
+  raw_data: (function(){
+    var __own = !!(config && config.price && config.price.enable_own_price);
+    var __applyVat = !!(config && config.price && config.price.apply_vat === true);
+    var __vat = (typeof config.price.vat === 'number' ? config.price.vat : 0.25);
+    var __addOre = ((config && config.price && config.price.addition_ore) || 0);
+    var __baseKr = (Number(heat.current) || 0) / 100;
+    var __showKr = __own ? (__baseKr * (__applyVat ? (1 + __vat) : 1) + (__addOre/100)) : __baseKr;
+    return Number((__showKr * 100).toFixed(2));
+  })(),
+  info: "Current electrical price",
+  titel: "Electric price",
+  register: "electric_price",
+  unit: "öre",
+  icon_name: "fa-flash"
+};
+// === OWN THRESHOLDS → OVERRIDE LEVELS (local analysis path) ===
+try {
+  var __ownSetting = (config && config.price && config.price.enable_own_setting === true);
+  if (__ownSetting) {
+    var __ownPrice = (config && config.price && config.price.enable_own_price === true);
+    var __VATon    = (config && config.price && config.price.apply_vat === true);
+    var __VAT      = (config && config.price && typeof config.price.vat === 'number') ? config.price.vat : 0.25;
+    var __addOre   = Number((config && config.price && config.price.addition_ore) || 0);
+    var __vLow     = Number(config && config.price ? config.price.verycheap : NaN);
+    var __vHigh    = Number(config && config.price ? config.price.veryexpensive : NaN);
+    var __krNow    = Number(currentHour && currentHour.total) || 0; // kr/kWh
+    var __oreNow   = __ownPrice ? (( __VATon ? __krNow*(1+__VAT) : __krNow) * 100) + __addOre : (__krNow*100);
+
+    if (isFinite(__vLow) && isFinite(__vHigh)) {
+      if (__oreNow >= __vHigh) {
+        heat.level = 'VERY_EXPENSIVE';
+        if (typeof hw !== 'undefined' && hw && typeof hw.level !== 'undefined') hw.level = 'VERY_EXPENSIVE';
+      } else if (__oreNow <= __vLow) {
+        heat.level = 'VERY_CHEAP';
+        if (typeof hw !== 'undefined' && hw && typeof hw.level !== 'undefined') hw.level = 'VERY_CHEAP';
+      } else {
+        heat.level = 'NORMAL';
+        if (typeof hw !== 'undefined' && hw && typeof hw.level !== 'undefined') hw.level = 'NORMAL';
+      }
+      nibe.log('OWN THRESHOLDS APPLIED (local) → heat.level='+heat.level+', oreNow='+__oreNow.toFixed(2)+' öre (vLow='+__vLow+', vHigh='+__vHigh+')','price','debug');
+    }
+  }
+} catch(e) {}
+
+                data.heat_price_level = { data: heat.level, raw_data: heat.level };
+                data.hw_price_level = { data: hw.level, raw_data: hw.level };
+
+                nibe.log(`Lokal AI analys klar. Nivå: ${heat.level}, Pris: ${data.price_current.data} öre`, 'price', 'debug');
+
+                var prio_add_enable = await getNibeData(hP['prio_add_enable']).catch(() => {});
+
+                if(prio_add_enable!==undefined) {
+                    if(config.price.prio_enable===true) {
+                        if(config.price.prio_cop===undefined) config.price.prio_cop = 3;
+                        if(config.price.prio_cost===undefined) config.price.prio_cost = 1;
+                        if(config.price.prio_tax===undefined) config.price.prio_tax = 45;
+                        if(config.price.prio_transfer===undefined) config.price.prio_transfer = 25;
+                        nibe.setConfig(config); // Save defaults if they were missing
+
+                        nibe.log(`Prioriterad tillsats är aktiverad som elprisreglering`,'price','debug');
+                        let price = data.price_current.raw_data;
+                        let fee = config.price.prio_tax + config.price.prio_transfer;
+                        let cop = config.price.prio_cop;
+                        let cost = config.price.prio_cost;
+
+                        // Jämför kostnad för 1 kWh värme från pumpen vs. alternativet
+                        // (price + fee) / cop  vs  cost * 100
+                        if((price + fee) > (cost * 100 * cop)) {
+                            if(prio_add_enable.raw_data===0) {
+                                nibe.log(`Värmepumpen är dyrare att köra än prioriterad tillsats. Slår på tillsats.`, 'price', 'debug');
+                                nibe.setData(hP['prio_add_enable'],1);
+                            }
+                        } else {
+                            if(prio_add_enable.raw_data===1) {
+                                nibe.log(`Värmepumpen är billigare att köra än prioriterad tillsats. Slår av tillsats.`, 'price', 'debug');
+                                nibe.setData(hP['prio_add_enable'],0);
+                            }
+                        }
+                    }
+                }
+
+                if (true) {
+                    priceAdjustCurve(data);
+                    adjustPool(data,data.system)
+                    .then(pool => {
+                        if(pool!==undefined){ nibe.log('POOL-EMIT sys='+data.system,'price','debug'); nibeData.emit('pluginPriceGraphPool',priceBuildPoolGraph(heat,data.system)); }
+                    })
+                    .catch(console.log);
+                }
+
+                nibeData.emit('pluginPrice',data);
+                nibeData.emit('pluginPriceGraph',priceaiBuildGraph(heat,hw,data,prio_add_enable));
+
+            } catch(err) {
+                nibe.log(`Fel i Lokal AI-styrning: ${err}`, 'price', 'error');
+                console.log(err);
+            }
+
+        } else if(config.price.source=="nibe") {
+            nibe.log(`Källan är Nibe`,'price','debug');
+            data.price_level = await getNibeData(hP['price_level']).catch(console.log);
+            data.price_enable = await getNibeData(hP['price_enable']).catch(console.log);
+            priceAdjustCurve(data)
+            data.price_current = await getNibeData(hP['price_current']).catch(console.log);
+            nibeData.emit('pluginPriceGraph',nibeBuildGraph(data,data.system));
+            nibeData.emit('pluginPrice',data);
+        } else if(config.price.source=="priceai" || config.price.source=="local_ai") {
+            nibe.log(`Källan är Lokal AI (via elprisetjustnu.se)`,'price','debug');
+
+            try {
+                const area = config.price.area || 'SE3';
+
+                // Steg 1: Hämta data från elprisetjustnu.se för idag och imorgon
+                const today = new Date();
+                const tomorrow = new Date(today);
+                tomorrow.setDate(tomorrow.getDate() + 1);
+
+                const todayYear = today.getFullYear();
+                const todayMonthDay = today.toISOString().slice(5, 10); // Ger "10-07"
+                const tomorrowYear = tomorrow.getFullYear();
+                const tomorrowMonthDay = tomorrow.toISOString().slice(5, 10);
+
+                const optionsToday = {
+                    hostname: 'www.elprisetjustnu.se',
+                    port: 443,
+                    path: `/api/v1/prices/${todayYear}/${todayMonthDay}_${area}.json`,
+                    method: 'GET'
+                };
+                const optionsTomorrow = {
+                    hostname: 'www.elprisetjustnu.se',
+                    port: 443,
+                    path: `/api/v1/prices/${tomorrowYear}/${tomorrowMonthDay}_${area}.json`,
+                    method: 'GET'
+                };
+
+                const [todayResult, tomorrowResult] = await Promise.all([
+                    getCloudData(optionsToday, "{}").catch(e => {
+                        nibe.log(`Kunde inte hämta priser för idag från elprisetjustnu.se`, 'price', 'warn');
+                        return [];
+                    }),
+                    getCloudData(optionsTomorrow, "{}").catch(e => {
+                        nibe.log(`Kunde inte hämta priser för imorgon (detta är normalt före kl 14).`, 'price', 'debug');
+                        return [];
+                    })
+                ]);
+
+                const rawPriceList = [].concat(todayResult || [], tomorrowResult || []);
+
+                if (rawPriceList.length === 0) {
+                    nibe.log('Ingen prisdata kunde hämtas från elprisetjustnu.se.', 'price', 'error');
+                    return;
+                }
+
+                // Steg 2: Medelvärdesbilda kvartspriser till timpriser
+                const hourlyPriceList = [];
+                const groupedByHour = rawPriceList.reduce((acc, price) => {
+                    const hour = price.time_start.substring(0, 13);
+                    if (!acc[hour]) {
+                        acc[hour] = [];
+                    }
+                    acc[hour].push(price.SEK_per_kWh);
+                    return acc;
+                }, {});
+                // Hämta offset för serverns tid (t.ex. ger -60 minuter för UTC+1)
+                const offset = -new Date().getTimezoneOffset();
+                const sign = offset >= 0 ? '+' : '-';
+                const pad = num => String(Math.abs(num)).padStart(2, '0');
+                const hoursOffset = Math.floor(Math.abs(offset) / 60);
+                const minsOffset = Math.abs(offset) % 60;
+                const timezoneString = `${sign}${pad(hoursOffset)}:${pad(minsOffset)}`;
+
+
+
+                for (const hour in groupedByHour) {
+                    const pricesInHour = groupedByHour[hour];
+                    const averagePrice = pricesInHour.reduce((sum, p) => sum + p, 0) / pricesInHour.length;
+                    hourlyPriceList.push({
+                        startsAt: `${hour}:00:00.000${timezoneString}`,
+                        total: averagePrice
+                    });
+                }
+                nibe.log(`Hämtade ${rawPriceList.length} kvartspunkter och konverterade till ${hourlyPriceList.length} stabila timpunkter.`, 'price', 'debug');
+                const fullPriceList = hourlyPriceList;
+
+                // VV-AI: cacha timpriser i RAM för VV-analys (ingen SD-skrivning)
+                vvAiPriceCache = fullPriceList;
+
+                const now = new Date();
+                now.setMinutes(0, 0, 0);
+                const futurePriceList = fullPriceList.filter(p => p && p.startsAt && (new Date(p.startsAt) >= now));
+                if (futurePriceList.length === 0) {
+                    nibe.log('Ingen framtida prisdata tillgänglig.', 'price', 'warn');
+                    return;
+                }
+                const currentHour = futurePriceList[0];
+                const currentHourDate = currentHour.startsAt;
+
+                const priceDataForAlgo = fullPriceList.map(p => ({
+                    value: p.total * 100, // ÖREN
+                    ts: new Date(p.startsAt).getTime(),
+                    date: p.startsAt
+                }));
+
+                const algoOptions = {
+                    timeWindow: config.price.time,
+                    minSpread: config.price.min_spread
+                };
+                const optimalTrades = optimizeElectricityTrading(priceDataForAlgo, algoOptions);
+
+                let currentLevel = 'NORMAL';
+                let veryCheapHours, cheapHours, expensiveHours, veryExpensiveHours;
+
+                if (optimalTrades.buy.length > 0) {
+                    const buyPrices = optimalTrades.buy.sort((a, b) => a.value - b.value);
+                    const sellPrices = optimalTrades.sell.sort((a, b) => a.value - b.value);
+                    const buyMedianIndex = Math.floor(buyPrices.length / 2);
+                    const sellMedianIndex = Math.floor(sellPrices.length / 2);
+
+                    veryCheapHours = new Set(buyPrices.slice(0, buyMedianIndex).map(p => p.date));
+                    cheapHours = new Set(buyPrices.slice(buyMedianIndex).map(p => p.date));
+                    expensiveHours = new Set(sellPrices.slice(0, sellMedianIndex).map(p => p.date));
+                    veryExpensiveHours = new Set(sellPrices.slice(sellMedianIndex).map(p => p.date));
+
+                    if (veryCheapHours.has(currentHourDate)) currentLevel = 'VERY_CHEAP';
+                    else if (cheapHours.has(currentHourDate)) currentLevel = 'CHEAP';
+                    else if (veryExpensiveHours.has(currentHourDate)) currentLevel = 'VERY_EXPENSIVE';
+                    else if (expensiveHours.has(currentHourDate)) currentLevel = 'EXPENSIVE';
+                }
+
+                const heat = {
+                    level: currentLevel,
+                    current: currentHour.total * 100,
+                    prices: fullPriceList.map(p => {
+                        const date = p.startsAt;
+                        let hourLevel = 'NORMAL';
+                        if (veryCheapHours && veryCheapHours.has(date)) hourLevel = 'VERY_CHEAP';
+                        else if (cheapHours && cheapHours.has(date)) hourLevel = 'CHEAP';
+                        else if (veryExpensiveHours && veryExpensiveHours.has(date)) hourLevel = 'VERY_EXPENSIVE';
+                        else if (expensiveHours && expensiveHours.has(date)) hourLevel = 'EXPENSIVE';
+                        return { value: p.total * 100, level: hourLevel, ts: new Date(p.startsAt).getTime() };
+                    })
+                };
+
+                const hw = { ...heat };
+                data.priceai = { heat, hw };
+                data.price_current = {
+  data: (function(){
+    var __own = !!(config && config.price && config.price.enable_own_price);
+    var __applyVat = !!(config && config.price && config.price.apply_vat === true);
+    var __vat = (typeof config.price.vat === 'number' ? config.price.vat : 0.25);
+    var __addOre = ((config && config.price && config.price.addition_ore) || 0);
+    var __baseKr = (Number(heat.current) || 0) / 100;
+    var __showKr = __own ? (__baseKr * (__applyVat ? (1 + __vat) : 1) + (__addOre/100)) : __baseKr;
+    return Number((__showKr * 100).toFixed(2));
+  })(),
+  raw_data: (function(){
+    var __own = !!(config && config.price && config.price.enable_own_price);
+    var __applyVat = !!(config && config.price && config.price.apply_vat === true);
+    var __vat = (typeof config.price.vat === 'number' ? config.price.vat : 0.25);
+    var __addOre = ((config && config.price && config.price.addition_ore) || 0);
+    var __baseKr = (Number(heat.current) || 0) / 100;
+    var __showKr = __own ? (__baseKr * (__applyVat ? (1 + __vat) : 1) + (__addOre/100)) : __baseKr;
+    return Number((__showKr * 100).toFixed(2));
+  })(),
+  info: "Current electrical price",
+  titel: "Electric price",
+  register: "electric_price",
+  unit: "öre",
+  icon_name: "fa-flash"
+};
+// === OWN THRESHOLDS → OVERRIDE LEVELS (local analysis path) ===
+try {
+  var __ownSetting = (config && config.price && config.price.enable_own_setting === true);
+  if (__ownSetting) {
+    var __ownPrice = (config && config.price && config.price.enable_own_price === true);
+    var __VATon    = (config && config.price && config.price.apply_vat === true);
+    var __VAT      = (config && config.price && typeof config.price.vat === 'number') ? config.price.vat : 0.25;
+    var __addOre   = Number((config && config.price && config.price.addition_ore) || 0);
+    var __vLow     = Number(config && config.price ? config.price.verycheap : NaN);
+    var __vHigh    = Number(config && config.price ? config.price.veryexpensive : NaN);
+    var __krNow    = Number(currentHour && currentHour.total) || 0; // kr/kWh
+    var __oreNow   = __ownPrice ? (( __VATon ? __krNow*(1+__VAT) : __krNow) * 100) + __addOre : (__krNow*100);
+
+    if (isFinite(__vLow) && isFinite(__vHigh)) {
+      if (__oreNow >= __vHigh) {
+        heat.level = 'VERY_EXPENSIVE';
+        if (typeof hw !== 'undefined' && hw && typeof hw.level !== 'undefined') hw.level = 'VERY_EXPENSIVE';
+      } else if (__oreNow <= __vLow) {
+        heat.level = 'VERY_CHEAP';
+        if (typeof hw !== 'undefined' && hw && typeof hw.level !== 'undefined') hw.level = 'VERY_CHEAP';
+      } else {
+        heat.level = 'NORMAL';
+        if (typeof hw !== 'undefined' && hw && typeof hw.level !== 'undefined') hw.level = 'NORMAL';
+      }
+      nibe.log('OWN THRESHOLDS APPLIED (local) → heat.level='+heat.level+', oreNow='+__oreNow.toFixed(2)+' öre (vLow='+__vLow+', vHigh='+__vHigh+')','price','debug');
+    }
+  }
+} catch(e) {}
+
+                data.heat_price_level = { data: heat.level, raw_data: heat.level };
+                data.hw_price_level = { data: hw.level, raw_data: hw.level };
+
+                nibe.log(`Lokal analys klar. Nivå: ${heat.level}, Pris: ${data.price_current.data} öre`, 'price', 'debug');
+
+                var prio_add_enable = await getNibeData(hP['prio_add_enable']).catch(() => {});
+
+                if(prio_add_enable!==undefined) {
+                    if(config.price.prio_enable===true) {
+                        if(config.price.prio_cop===undefined) config.price.prio_cop = 3;
+                        if(config.price.prio_cost===undefined) config.price.prio_cost = 1;
+                        if(config.price.prio_tax===undefined) config.price.prio_tax = 45;
+                        if(config.price.prio_transfer===undefined) config.price.prio_transfer = 25;
+                        nibe.setConfig(config);
+
+                        nibe.log(`Prioriterad tillsats är aktiverad som elprisreglering`,'price','debug');
+                        let price = data.price_current.raw_data;
+                        let fee = config.price.prio_tax + config.price.prio_transfer;
+                        let cop = config.price.prio_cop;
+                        let cost = config.price.prio_cost;
+
+                        if((price + fee) > (cost * 100 * cop)) {
+                            if(prio_add_enable.raw_data===0) {
+                                nibe.log(`Värmepumpen är dyrare att köra än prioriterad tillsats. Slår på tillsats.`, 'price', 'debug');
+                                nibe.setData(hP['prio_add_enable'],1);
+                            }
+                        } else {
+                            if(prio_add_enable.raw_data===1) {
+                                nibe.log(`Värmepumpen är billigare att köra än prioriterad tillsats. Slår av tillsats.`, 'price', 'debug');
+                                nibe.setData(hP['prio_add_enable'],0);
+                            }
+                        }
+                    }
+                }
+
+                if (true) {
+                    priceAdjustCurve(data);
+                    adjustPool(data,data.system)
+                    .then(pool => {
+                        if(pool!==undefined){ nibe.log('POOL-EMIT sys='+data.system,'price','debug'); nibeData.emit('pluginPriceGraphPool',priceBuildPoolGraph(heat,data.system)); }
+                    })
+                    .catch(console.log);
+                }
+
+                nibeData.emit('pluginPrice',data);
+                nibeData.emit('pluginPriceGraph',priceaiBuildGraph(heat,hw,data,prio_add_enable));
+
+            } catch (err) {
+                nibe.log(`Fel vid hämtning/analys från elprisetjustnu.se: ${err}`, 'price', 'error');
+                console.log(err);
+            }
+        }
+    }
+}
+
+// ORGINAL runPrice
+    async function notUsedAnyLongerrunPrice(data,array) {
+
         nibe.log(`Startar elprisreglering runPrice()`,'price','debug');
         //let data = Object.assign({}, result);
         let config = nibe.getConfig();
@@ -1324,7 +3889,7 @@ module.exports = function(RED) {
             nibe.log(`Elprisreglering är aktiverad`,'price','debug');
             if(config.price.source=="tibber") {
                 nibe.log(`Källan är Tibber`,'price','debug');
-                
+
                 if(config.price.token!==undefined && config.price.token!=="") {
                     let token = config.price.token;
                     const options = {
@@ -1397,7 +3962,7 @@ module.exports = function(RED) {
                     sendError('Cloud',`Token är inte giltigt.`);
                     return
                 }
-                
+
             } else if(config.price.source=="nibe") {
                 nibe.log(`Källan är Nibe`,'price','debug');
                 data.price_level = await getNibeData(hP['price_level']).catch(console.log);
@@ -1408,11 +3973,11 @@ module.exports = function(RED) {
                 nibeData.emit('pluginPrice',data);
             } else if(config.price.source=="priceai") {
                 nibe.log(`Källan är AI`,'price','debug');
-                
+
                 if(config.price.token!==undefined && config.price.token!=="") {
                     let token = config.price.token;
-                    
-                    
+
+
                     try {
                         const optionsHeat = {
                             hostname: 'nibepi.anerdins.se',
@@ -1478,6 +4043,37 @@ module.exports = function(RED) {
                             data.price_current = {};
                             data.price_current.data = Number((heat.current).toFixed(2))
                             data.price_current.raw_data = Number((heat.current).toFixed(2))
+// === OWN THRESHOLDS → OVERRIDE LEVELS (AI values path) ===
+try {
+  var __ownSetting2 = (config && config.price && config.price.enable_own_setting === true);
+  if (__ownSetting2) {
+    var __ownPrice2 = (config && config.price && config.price.enable_own_price === true);
+    var __VATon2    = (config && config.price && config.price.apply_vat === true);
+    var __VAT2      = (config && config.price && typeof config.price.vat === 'number') ? config.price.vat : 0.25;
+    var __addOre2   = Number((config && config.price && config.price.addition_ore) || 0);
+    var __vLow2     = Number(config && config.price ? config.price.verycheap : NaN);
+    var __vHigh2    = Number(config && config.price ? config.price.veryexpensive : NaN);
+    // heat.current is assumed to be öre/kWh in this branch
+    var __oreNow2   = Number(heat && heat.current) || 0;
+    if (__ownPrice2) {
+      __oreNow2 = (__VATon2 ? __oreNow2 * (1+__VAT2) : __oreNow2) + __addOre2;
+    }
+    if (isFinite(__vLow2) && isFinite(__vHigh2)) {
+      if (__oreNow2 >= __vHigh2) {
+        heat.level = 'VERY_EXPENSIVE';
+        if (typeof hw !== 'undefined' && hw && typeof hw.level !== 'undefined') hw.level = 'VERY_EXPENSIVE';
+      } else if (__oreNow2 <= __vLow2) {
+        heat.level = 'VERY_CHEAP';
+        if (typeof hw !== 'undefined' && hw && typeof hw.level !== 'undefined') hw.level = 'VERY_CHEAP';
+      } else {
+        heat.level = 'NORMAL';
+        if (typeof hw !== 'undefined' && hw && typeof hw.level !== 'undefined') hw.level = 'NORMAL';
+      }
+      nibe.log('OWN THRESHOLDS APPLIED (AI) → heat.level='+heat.level+', oreNow='+__oreNow2.toFixed(2)+' öre (vLow='+__vLow2+', vHigh='+__vHigh2+')','price','debug');
+    }
+  }
+} catch(e) {}
+
                             data.heat_price_level = {};
                             data.heat_price_level.data = heat.level;
                             data.heat_price_level.raw_data = heat.level;
@@ -1537,32 +4133,34 @@ module.exports = function(RED) {
                                     }
                                 }
                             }
-                            if(prio_add_enable===undefined || prio_add_enable.raw_data===0) {
+                            if (true) {
                                 priceAdjustCurve(data)
                                 adjustPool(data,data.system)
                                 .then(pool => {
-                                    if(pool!==undefined) nibeData.emit('pluginPriceGraphPool',priceBuildPoolGraph(heat,data.system));
+                                    if(pool!==undefined){ nibe.log('POOL-EMIT sys='+data.system,'price','debug'); nibeData.emit('pluginPriceGraphPool',priceBuildPoolGraph(heat,data.system)); }
                                 })
                                 .catch(console.log)
                             }
-                            
+
                             nibeData.emit('pluginPrice',data);
                             nibeData.emit('pluginPriceGraph',priceaiBuildGraph(heat,hw,data,prio_add_enable));
                         })
                     } catch(err) {
                         console.log(err)
                     }
-                    
+
                 }
             }
         }
-        
+
     }
     const sendError = (from,message) => {
         let data = {from:from,message:message};
         nibeData.emit('fault',data);
     };
-    const adjustPool = (dataIn,system) => {
+    const POOL_DEBUG = true;  // sätt till false för att stänga av
+
+	const adjustPool = (dataIn,system) => {
         const promise = new Promise((resolve,reject) => {
             try {
                 var data = Object.assign({}, dataIn);
@@ -1575,6 +4173,7 @@ module.exports = function(RED) {
                     config.price.pool_enable_s1 = false
                     config.price.VERY_CHEAP_POOL_HEAT = 0
                     config.price.CHEAP_POOL_HEAT = 0
+		            config.price.NORMAL_POOL_HEAT = 0
                     config.price.NORMAL_START_POOL_HEAT = 28
                     config.price.NORMAL_STOP_POOL_HEAT = 32
                     config.price.EXPENSIVE_POOL_HEAT = 0
@@ -1587,6 +4186,13 @@ module.exports = function(RED) {
                     config.price.VERY_EXPENSIVE_POOL_CPR = 0
                     nibe.setConfig(config);
                 }
+
+				// Migration/guard: se till att NORMAL_POOL_HEAT finns även om defaults-blocket inte körs
+				if (config.price.NORMAL_POOL_HEAT === undefined) {
+				  config.price.NORMAL_POOL_HEAT = 0;
+				  nibe.setConfig(config);
+				}
+
                 if(config.price.pool_enable_s1===true) {
                     const poolTemp = getNibeData(hP['pool_temp_'+system]).catch(console.log)
                     const poolStart = getNibeData(hP['pool_start_temp_'+system]).catch(console.log)
@@ -1594,7 +4200,45 @@ module.exports = function(RED) {
                     const poolCpr = getNibeData(hP['pool_cpr_'+system]).catch(console.log)
                     if(config.price.pool_max_temp===undefined || isNaN(config.price.pool_max_temp)) config.price.pool_max_temp = 100
                     Promise.all([poolTemp, poolStart, poolStop, poolCpr]).then((values) => {
-                        let level = data.price_level.data;
+
+                        const [poolTemp, poolStart, poolStop, poolCpr] = values || [];
+
+                        // Hjälpare för att extrahera siffra ur ev. objekt från getNibeData
+						function val(v) {
+						  if (v && typeof v === 'object') {
+							// vanliga fält: data / value / payload / raw
+							if (v.data !== undefined) return v.data;
+							if (v.value !== undefined) return v.value;
+							if (v.payload !== undefined) return v.payload;
+							if (v.raw !== undefined) return v.raw;
+						  }
+						  return v;
+						}
+
+						// ---- ADDED: Minimal debug av sensorer (utan "price") ----
+                        if (POOL_DEBUG === true) {
+                            console.log(
+                                '[POOL DEBUG] system=' + system +
+								' T=' + val(poolTemp) + '°C start=' + val(poolStart) + '°C stop=' + val(poolStop) + '°C cpr=' + val(poolCpr)
+                            );
+						}
+                        // ---- /ADDED ----
+
+
+                        // PATCH: robust price level lookup (supports heat_price_level, price_level, priceai.heat.level)
+                        let level = null;
+                        try {
+                            level = (data && data.heat_price_level && data.heat_price_level.data) ||
+                                    (data && data.price_level && data.price_level.data) ||
+                                    (data && data.priceai && data.priceai.heat && data.priceai.heat.level) ||
+                                    null;
+                        } catch(e) { level = null; }
+
+// SAFE fallback: force NORMAL if level missing/unknown
+if (!level || (typeof level === 'string' && !['VERY_CHEAP','CHEAP','NORMAL','EXPENSIVE','VERY_EXPENSIVE'].includes(level.toUpperCase()))) {
+    level = 'NORMAL';
+}
+
                         if(config.price[`${level}_POOL_HEAT`]!==undefined) {
                             if(level=="NORMAL") {
                                 nibe.setData(hP['pool_start_temp_'+system],config.price.NORMAL_START_POOL_HEAT)
@@ -1606,12 +4250,12 @@ module.exports = function(RED) {
                                 nibe.setData(hP['pool_start_temp_'+system],Math.min(start+adjust,config.price.pool_max_temp))
                                 nibe.setData(hP['pool_stop_temp_'+system],Math.min(stop+adjust,config.price.pool_max_temp))
                             }
-                            
+
                             resolve(values)
                         } else {
                             resolve()
                         }
-                        
+
                     }).catch((err) => {
                         sendError('Elprisreglering Poolstyrning',`Kunde inte hämta data, har värmepumpen stöd för pool?`);
                     });
@@ -1622,6 +4266,7 @@ module.exports = function(RED) {
         });
         return promise;
     }
+
     const getCloudData = (options,request) => {
         const promise = new Promise((resolve,reject) => {
         let config = nibe.getConfig();
@@ -1649,8 +4294,8 @@ module.exports = function(RED) {
                     const hwStartTemp = getNibeData(hP['hw_start_0']).catch(console.log);
                     const hwStopTemp = getNibeData(hP['hw_stop_2']).catch(console.log);
                     Promise.all([bt6, bt7, hwStartTemp, hwStopTemp]).then((values) => {
-                        
-                        
+
+
                         request = JSON.parse(request)
                         request.battery = {
                             capacity:values[3].data,
@@ -1685,47 +4330,49 @@ module.exports = function(RED) {
             const promise = new Promise((resolve,reject) => {
                 let data = "";
                 const req = https.request(options, (res) => {
-                
+
                 res.on('data', (d) => {
                         data += d;
-                    
+
                 })
                 res.on('end', () => {
                     if(res.statusCode===200) {
                         try {
                             data = JSON.parse(data)
-                            
+
                             nibe.log(`Data hämtad via http`,'price','debug');
                             resolve(data)
                         } catch {
                             sendError('Elprisreglering Cloud',`Kunde inte hantera JSON data`);
-                            
-                            nibe.log(`Något blev fel vid JSON konvertering`,'price','debug');
+                            // NY, FÖRBÄTTRAD LOGGNING: Skriver ut det råa svaret
+                            nibe.log(`Något blev fel vid JSON konvertering. Servern svarade: ${data}`, 'price', 'error');
+
+                            //nibe.log(`Något blev fel vid JSON konvertering`,'price','debug');
                             reject('No JSON response')
                         }
                     } else {
                         sendError('Cloud',`Ej kontakt med servern`);
                         reject(res.statusMessage)
                     }
-                    
+
                 });
                 })
-                
+
                 req.on('error', (error) => {
                 sendError('Cloud',`Ej kontakt med servern`);
                 reject(error)
                 })
-                
+
                 req.write(request)
                 req.end()
                 });
             return promise;
         }
-        
+
         });
         return promise;
     }
-    
+
 function scale (number, inMin, inMax, outMin, outMax) {
     return (number - inMin) * (outMax - outMin) / (inMax - inMin) + outMin;
 }
@@ -1775,11 +4422,11 @@ const lockFreq = (options) => {
                         } else {
                             nibe.setData(hP['lock_freq_1_activate'],"0",(err,result) => {
                                 if(err) {
-        
+
                                 } else {
                                     nibe.setData(hP['lock_freq_1_activate'],"1")
                                 }
-        
+
                             });
                         }
 
@@ -1828,7 +4475,7 @@ const lockFreq = (options) => {
     } else {
         reject(`This model does not support slowing the frequency down.`)
     }
-    
+
     });
     return promise;
 }
@@ -1868,10 +4515,10 @@ const blockAdditive = (options) => {
                     }
                 }
             })
-            
+
         }
     }
-    
+
     });
     return promise;
 }
@@ -1892,7 +4539,7 @@ const blockAdditive = (options) => {
         let hwStartTemp;
         let hwStopTemp;
         let data = {};
-        if(config.hotwater.enable_autoluxury===true || config.hotwater.enable_hw_priority===true) {      
+        if(config.hotwater.enable_autoluxury===true || config.hotwater.enable_hw_priority===true) {
             hwON = await getNibeData(hP['startHW']).catch(console.log);
             bt6 = await getNibeData(hP['bt6']).catch(console.log);
             bt7 = await getNibeData(hP['bt7']).catch(console.log);
@@ -1941,7 +4588,7 @@ const blockAdditive = (options) => {
                         //console.log('Not huge hotwater load')
                     }
                 //}
-                
+
             } else {
                 //console.log('Hotwater is already running luxury');
                 if(hwTargetValue!==undefined) {
@@ -1989,7 +4636,7 @@ const blockAdditive = (options) => {
             saveDataGraph('hw_start_temp',time,hwStartTemp.data,true);
             nibeData.emit('pluginHotwaterPriority',data);
         }
-        
+
     }
 let fan_mode;
 let fan_mode_saved;
@@ -2001,7 +4648,135 @@ let fan_filter_low_eff;
 let filter_eff;
 let dMboost = false;
 let co2boost = false;
+let isRunFanExecuting = false;
+
 async function runFan() {
+    if (isRunFanExecuting) {
+        nibe.log('runFan körs redan, avvaktar denna körning.', 'fan', 'debug');
+        return;
+    }
+    isRunFanExecuting = true;
+    nibe.log('Kör runFan()', 'fan', 'debug');
+
+    try {
+        let config = nibe.getConfig();
+        var data = {};
+        var timeNow = Date.now();
+        if(config.fan===undefined) { config.fan = {}; nibe.setConfig(config); }
+        if(config.fan.enable!==true) {
+            return;
+        }
+
+        // Steg 1: Hämta grundläggande data (återgår till steg-för-steg-metoden)
+        data.cpr_set = await getNibeData(hP['cpr_set']).catch(console.log);
+        data.temp_fan_speed = await getNibeData(hP['fan_mode']).catch(console.log);
+        data.fan_speed = await getNibeData(hP['fan_speed']).catch(console.log);
+        data.bs1_flow = await getNibeData(hP['bs1_flow']).catch(console.log);
+        data.alarm = await getNibeData(hP['alarm']).catch(console.log);
+        data.evaporator = await getNibeData(hP['evaporator']).catch(console.log);
+
+        if ([data.cpr_set, data.temp_fan_speed, data.fan_speed, data.bs1_flow, data.alarm, data.evaporator].some(val => val === undefined)) {
+            nibe.log('Väntar på all startdata från värmepumpen...', 'fan', 'debug');
+            return;
+        }
+
+        nibe.log(`[DEBUG Fan Input] Indata: cpr_set=${data.cpr_set.raw_data}Hz, bs1_flow=${data.bs1_flow.raw_data}m3/h, fan_speed=${data.fan_speed.raw_data}%, temp_force=${data.temp_fan_speed.raw_data}`, 'fan', 'debug');
+
+        // Steg 2: Bestäm börvärde (flow_set)
+        let current_mode = "normal";
+        let flow_set = config.fan.speed_normal;
+        nibe.log(`Grundinställning: Normalt luftflöde (${flow_set} m3/h)`, 'fan', 'debug');
+
+        if (config.fan.enable_low === true && data.cpr_set.raw_data > 0 && data.cpr_set.raw_data < config.fan.low_cpr_freq) {
+            current_mode = "low";
+            flow_set = config.fan.speed_low;
+            nibe.log(`Kompressorn körs på låg frekvens (${data.cpr_set.raw_data} Hz). Aktiverar sänkt luftflöde: ${flow_set} m3/h`, 'fan', 'debug');
+        }
+
+        if (config.fan.enable_dm_boost === true && config.system.pump !== "F370" && config.system.pump !== "F470") {
+            data.dM = await getNibeData(hP['dM']).catch(console.log);
+            data.dMstart = await getNibeData(hP['dMstart']).catch(console.log);
+            data.dMaddstart = await getNibeData(hP['dMaddstart']).catch(console.log);
+
+            if(data.dM && data.dMstart && data.dMaddstart) {
+                let boost_threshold = data.dMaddstart.data + (config.fan.dm_boost_start || 300);
+                if (data.dM.data < boost_threshold) {
+                    current_mode = "dm_boost";
+                    flow_set = config.fan.dm_boost_value;
+                    nibe.log(`Gradminuter (${data.dM.data}) under boostgräns (${boost_threshold}). Aktiverar boost-flöde: ${flow_set} m3/h`, 'fan', 'debug');
+                }
+            }
+        }
+
+        nibe.log(`[DEBUG Fan Logic] Slutgiltigt börvärde (flow_set) bestämt till: ${flow_set} m3/h`, 'fan', 'debug');
+
+        // Steg 3: Utför reglering
+        nibe.log(`[DEBUG Fan Villkor] Kontrollerar villkor för reglering: Avfrostning (alarm!=183): ${data.alarm.raw_data !== 183}, Förångare (>0): ${data.evaporator.raw_data > 0}, Tillfällig forcering (==0): ${data.temp_fan_speed.raw_data === 0}`, 'fan', 'debug');
+
+        if((data.alarm.raw_data !== 183 && data.evaporator.raw_data > 0 && data.temp_fan_speed.raw_data === 0)) {
+            if(flow_set === undefined) {
+                nibe.log(`Inget börvärde kunde bestämmas, avvaktar...`,'fan','warn');
+                return;
+            }
+
+            // Originalets regleringslogik
+            if(data.bs1_flow.raw_data > (flow_set + 20)) {
+                if(data.fan_speed.raw_data - 5 > 10) nibe.setData(hP.fan_speed, (data.fan_speed.raw_data - 5));
+                else if(data.fan_speed.raw_data > 10) nibe.setData(hP.fan_speed, (data.fan_speed.raw_data - 1));
+            } else if(data.bs1_flow.raw_data > (flow_set + 10)) {
+                if(data.fan_speed.raw_data > 0) nibe.setData(hP.fan_speed, (data.fan_speed.raw_data - 1));
+            } else if(data.bs1_flow.raw_data < (flow_set - 20)) {
+                if(data.fan_speed.raw_data + 5 < 100) nibe.setData(hP.fan_speed, (data.fan_speed.raw_data + 5));
+                else if(data.fan_speed.raw_data < 100) nibe.setData(hP.fan_speed, (data.fan_speed.raw_data + 1));
+            } else if(data.bs1_flow.raw_data < (flow_set - 10)) {
+                if(data.fan_speed.raw_data < 100) nibe.setData(hP.fan_speed, (data.fan_speed.raw_data + 1));
+            } else {
+                 nibe.log(`Luftflöde stabilt (${data.bs1_flow.raw_data} m3/h)`,'fan','debug');
+                 if (config.fan.enable_filter === true) {
+                    if (current_mode == "low") {
+                        if (config.fan.filter_value_low === -1) {
+                            config.fan.filter_value_low = data.fan_speed.raw_data;
+                            nibe.setConfig(config);
+                        } else if (config.fan.filter_value_low > 0) {
+                            fan_filter_low_eff = Number(((config.fan.filter_value_low / data.fan_speed.raw_data) * 100).toFixed(0));
+                        }
+                    } else if (current_mode == "normal") {
+                        if (config.fan.filter_value_normal === -1) {
+                            config.fan.filter_value_normal = data.fan_speed.raw_data;
+                            nibe.setConfig(config);
+                        } else if (config.fan.filter_value_normal > 0) {
+                            fan_filter_normal_eff = Number(((config.fan.filter_value_normal / data.fan_speed.raw_data) * 100).toFixed(0));
+                        }
+                    }
+                 }
+            }
+        }
+
+        // Steg 4: Spara och rapportera data
+        data.cpr_act = await getNibeData(hP['cpr_act']).catch(console.log);
+        saveDataGraph('fan_setpoint',timeNow,flow_set,true);
+        if(fan_filter_low_eff!==undefined && fan_filter_normal_eff===undefined) {
+            filter_eff = Number((fan_filter_low_eff).toFixed(0));
+            if(filter_eff>100) filter_eff = 100;
+        } else if(fan_filter_low_eff===undefined && fan_filter_normal_eff!==undefined) {
+            filter_eff = Number((fan_filter_normal_eff).toFixed(0));
+            if(filter_eff>100) filter_eff = 100;
+        } else if(fan_filter_low_eff!==undefined && fan_filter_normal_eff!==undefined) {
+            filter_eff = Number(((fan_filter_low_eff+fan_filter_normal_eff)/2).toFixed(0));
+            if(filter_eff>100) filter_eff = 100;
+        }
+        saveDataGraph('filter_eff',timeNow,filter_eff,true);
+        data.filter_eff = filter_eff;
+        data.setpoint = flow_set;
+        nibeData.emit('pluginFan',data);
+    } finally {
+        isRunFanExecuting = false;
+    }
+}
+
+
+//##ORGINAL RUNFAN()
+async function runFanOrginal() {
     async function checkBoost(data) {
         const promise = new Promise(async function (resolve,reject) {
         let config = nibe.getConfig();
@@ -2106,7 +4881,7 @@ async function runFan() {
         nibe.log('Ingen data från fläktforceringsregister. Avbryter...','fan','error');
         return;
     }
-    
+
     data.co2Sensor;
     data.fan_speed = await getNibeData(hP['fan_speed']).catch(console.log);
     data.bs1_flow = await getNibeData(hP['bs1_flow']).catch(console.log);
@@ -2114,7 +4889,7 @@ async function runFan() {
     data.alarm = await getNibeData(hP['alarm']).catch(console.log);
     data.evaporator = await getNibeData(hP['evaporator']).catch(console.log);
     data.cpr_set = await getNibeData(hP['cpr_set']).catch(console.log);
-    
+
     if(config.fan.enable_co2===true) {
     if(config.fan.sensor===undefined || config.fan.sensor=="Ingen") {
         nibe.log('CO2 givare inte vald.','fan','error');
@@ -2151,7 +4926,7 @@ async function runFan() {
                     data.co2Sensor.data.timestamp = timeNow;
                     saveDataGraph('fan_co2Sensor',timeNow,data.co2Sensor.data.data,true)
                 }
-                
+
             },(error => {
                 nibe.log(`CO2 givare ${data.co2Sensor.name} har inga värden än.`,'fan','error');
             }));
@@ -2193,7 +4968,7 @@ async function runFan() {
                         }
                     } else {
                         nibe.log(`CO2 givares värde (${data.co2Sensor.data.data}) under gränsvärde ${config.fan.high_co2_limit}`,'fan','debug');
-                        
+
                         if(data.alarm.raw_data!==183) {
                             if(fan_saved!==undefined) {
                                 nibe.setData(hP.fan_speed,fan_saved);
@@ -2221,7 +4996,7 @@ async function runFan() {
         await checkBoost(data).then(result => {
             nibe.log(`Villkor för gradminutboosting uppfyllda.`,'fan','debug');
             flow_set = config.fan.dm_boost_value;
-            
+
         },(err => {
             if(err) {
                 //nibe.log(err,'fan','error');
@@ -2264,7 +5039,7 @@ async function runFan() {
                             } else {
                                     nibe.log(`Inget värde på CO2 givare, ställer in normalt luftflöde: ${config.fan.speed_normal} m3/h`,'fan','debug');
                                     flow_set = config.fan.speed_normal;
-                                    fan_mode = "normal";                            
+                                    fan_mode = "normal";
                             }
                         } else {
                             nibe.log(`CO2 styrning ej aktiverad`,'fan','debug');
@@ -2315,8 +5090,8 @@ async function runFan() {
             }
         }));
     }
-    
-    
+
+
     // Start regulating only if not defrosting and vented air is above freezing temperatures.
     if((data.alarm.raw_data!==183 && data.evaporator.raw_data>0 && data.temp_fan_speed!==undefined && data.temp_fan_speed.raw_data===0)) {
         if(flow_set<30) {
@@ -2380,7 +5155,7 @@ async function runFan() {
                         let saved = config.fan.filter_value_normal;
                         fan_filter_normal_eff = Number(((saved/data.fan_speed.raw_data)*100).toFixed(0));
                     }
-                    
+
                 }
             }
             fan_mode = undefined;
@@ -2488,7 +5263,7 @@ function saveDataGraph(name,ts,data,save=false) {
                     } else {
                         savedGraph[name].push({x:ts,y:data});
                     }
-                    
+
                 }
             }
         } else {
@@ -2506,7 +5281,7 @@ function saveDataGraph(name,ts,data,save=false) {
     if(save===true) {
         savedData[name] = {data:data,raw_data:data,timestamp:ts};
     }
-    
+
 }
 const gethP  = () => {
     return hP;
@@ -2553,7 +5328,7 @@ async function runDiagnostic() {
                     savedRunTime = Date.now();
                     saveDataGraph('cpr_runtime',Date.now(),Number(((Date.now()-savedRunTime)/60000).toFixed(0)),true);
                     cpr_running = true;
-                    
+
                 } else {
                     nibe.log(`Compressor running.`,'diagnostic','debug');
                     saveDataGraph('cpr_runtime',Date.now(),Number(((Date.now()-savedRunTime)/60000).toFixed(0)),true);
@@ -2695,7 +5470,7 @@ const checkTranslation = (node) => {
                 }
             })
         }
-        
+
         const handleCore = (config,force=false) => {
             if(config.connection===undefined) config.connection = {};
             if(config.serial===undefined) config.serial = {};
@@ -2731,7 +5506,7 @@ const checkTranslation = (node) => {
                                     hP.supply_s1 = "40071";
                                     console.log('Register 40071 found, using it for supply temp S1')
                                 }
-                                
+
                                 //if(config.system.pump=="F750") hP.supply_s1 = "40047";
                                 //if(config.system.pump=="F1345") hP.supply_s1 = "40071";
                                 sendError('Kärnan',`Nibe ${config.system.pump} är ansluten`);
@@ -2795,7 +5570,7 @@ const checkTranslation = (node) => {
         },(err => {
 
         }));
-        
+
         RED.httpAdmin.post("/config/:id", RED.auth.needsPermission("nibe-config.write"), function(req, res) {
             nibe.setConfig(req.body.config);
             handleCore(req.body.config);
@@ -2808,7 +5583,7 @@ const checkTranslation = (node) => {
         async function saveGraph() {
             const promise = new Promise((resolve,reject) => {
                 let config = nibe.getConfig();
-                
+
                     trimGraph().then(data => {
                         if(config.system.save_graph!==undefined && config.system.save_graph===true) {
                             if(savedGraph!==undefined && savedGraph.length!==0) {
@@ -2822,8 +5597,8 @@ const checkTranslation = (node) => {
                             reject('Not saving graphs')
                         }
                     })
-                
-            
+
+
         });
         return promise
         }
@@ -2841,33 +5616,34 @@ const checkTranslation = (node) => {
             });
             return promise;
         }
-        
+
         var everyminute = cron.schedule('*/1 * * * *', () => {
             if(nibe.core!==undefined && nibe.core.connected!==undefined && nibe.core.connected===true) {
                 nibeData.emit('updateGraph');
                 minuteUpdate();
                 hotwaterPlugin();
+                vvAiTick();
                 runFan()
             }
-            
+
         })
         var threeminutes = cron.schedule('*/3 * * * *', () => {
             if(nibe.core!==undefined && nibe.core.connected!==undefined && nibe.core.connected===true) {
                 updateData();
             }
-            
+
         })
         var tenminutes = cron.schedule('*/10 * * * *', () => {
             if(nibe.core!==undefined && nibe.core.connected!==undefined && nibe.core.connected===true) {
                 tenMinuteUpdate()
             }
         })
-        
+
         var hourly = cron.schedule('0 * * * *', () => {
             if(nibe.core!==undefined && nibe.core.connected!==undefined && nibe.core.connected===true) {
             //let graph = this.context().global.get(`graphs`);
             saveGraph().catch(err => {
-                
+
             });
             updateData(true);
             }
@@ -2884,7 +5660,7 @@ const checkTranslation = (node) => {
         this.context().global.set(`config`, this.config);
     })
 
-    
+
     nibe.data.on('data',data => {
         nibeData.emit(data.register,data);
         nibeData.emit('data',data);
@@ -2914,8 +5690,8 @@ const checkTranslation = (node) => {
             } else {
                 sendError(data.from,data.message);
             }
-            
-        })        
+
+        })
         this.config = nibe.getConfig();
         this.saveGraph = saveGraph;
         this.suncalc = suncalc;
@@ -2949,7 +5725,7 @@ const checkTranslation = (node) => {
             clearTimeout(timer.diagnostic);
         });
     }
-    
+
     RED.nodes.registerType("nibe-config",nibeConfig);
 
 }
