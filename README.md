@@ -1,3 +1,25 @@
+Diverse ändringar:
+- Pool: justeringar av nycklar/mappning (bl.a. F1255)
+- Prisinställningar: inköpspris + moms/påslag så priset visas korrekt i graf
+- VV-AI Lärande: lär sig era VV-vanor och bygger VV-plan/visualisering
+
+## TA BACKUP AV BEFINTLIGT NODERED!
+```
+cd ~/.node-red/node_modules
+cp -a node-red-contrib-nibepi node-red-contrib-nibepi_backup_$(date +%F_%H%M)
+```
+
+## Installera / uppdatera (Node-RED)
+```
+cd ~/.node-red
+npm install --save pizzihelmet/node-red-contrib-nibepi#vv-ai
+sudo systemctl restart nodered
+```
+
+OBS: Flows behöver också uppdateras:
+https://github.com/pizzihelmet/nibepi-flow/tree/vv-ai-flow
+
+
 # node-red-contrib-nibepi
 Node-RED plugins for NibePi interface for connecting to Nibe F series heatpump<br>
 <p>Link to downloadable image: http://anerdins.se/NibePi/nibepi_1.1_clean.rar</p>
