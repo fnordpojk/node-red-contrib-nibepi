@@ -1,6 +1,7 @@
 Diverse ändringar:
 - Pool: justeringar av nycklar/mappning (bl.a. F1255)
-- Prisinställningar: inköpspris + moms/påslag så priset visas korrekt i graf
+- Inställning utav Väldigt högt/lågt pris fungerar.
+- Prisinställningar: inköpspris + moms/påslag så priset visas med det i graf. Ställs in på "startsidan"
 - VV-AI Lärande: lär sig era VV-vanor och bygger VV-plan/visualisering
 
 ## TA BACKUP AV BEFINTLIGT NODERED!
