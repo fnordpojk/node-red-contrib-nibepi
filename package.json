@@ -30,7 +30,7 @@
       "nibe-rmu": "rmu.js",
       "nibe-fan": "fan.js",
       "nibe-graph": "graph.js",
-      "hotwater_ai": "hotwater_ai.js"
+      "nibe-hotwater-ai": "hotwater_ai.js"
     }
   },
   "scripts": {
