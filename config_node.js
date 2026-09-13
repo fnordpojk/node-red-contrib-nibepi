@@ -1878,6 +1878,32 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
         var datum = Date.parse(strDate);
         return Number((datum).toFixed());
     }
+    const isMissingValue = (value) => {
+        return value === undefined || value === null || value === 9999 || value === 9999.0 || value === '9999';
+    }
+    const getTimeString = (timeSeries) => {
+        if(timeSeries === undefined || timeSeries === null) return undefined;
+        return timeSeries.validTime || timeSeries.time;
+    }
+    const getParamValue = (timeSeries, candidates = [], fallback = undefined) => {
+        if(timeSeries === undefined || timeSeries === null) return fallback;
+        if(timeSeries.data !== undefined && timeSeries.data !== null) {
+            for(const key of candidates) {
+                if(Object.prototype.hasOwnProperty.call(timeSeries.data, key) && !isMissingValue(timeSeries.data[key])) {
+                    return timeSeries.data[key];
+                }
+            }
+        }
+        if(Array.isArray(timeSeries.parameters)) {
+            for(const key of candidates) {
+                const found = timeSeries.parameters.find(param => param && param.name == key);
+                if(found && Array.isArray(found.values) && found.values.length > 0 && !isMissingValue(found.values[0])) {
+                    return found.values[0];
+                }
+            }
+        }
+        return fallback;
+    }
     const initiateCore = (host,port,cb) => {
         nibe.initiateCore(host,port, (err,data) => {
             if(err) console.log(err);
@@ -2336,16 +2362,17 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
             var temp_arr = [];
             var feel_arr = [];
             var direction_arr = [];
-            for( var o = 0; o < 49; o++){
-                let timestamp = toTimestamp(array[o].validTime)
-                let speed = array[o].parameters.find(speed => speed.name == "ws");
-                let dir = array[o].parameters.find(dir => dir.name == "wd");
-                let gust = array[o].parameters.find(gust => gust.name == "gust");
-                let temp = array[o].parameters.find(temp => temp.name == "t");
-                speed = speed.values[0];
-                gust = gust.values[0];
-                temp = temp.values[0];
-                dir = dir.values[0];
+            const limit = Math.min(49, (Array.isArray(array) ? array.length : 0));
+            for( var o = 0; o < limit; o++){
+                const timeSeries = array[o];
+                const timeString = getTimeString(timeSeries);
+                if(timeString===undefined) continue;
+                let timestamp = toTimestamp(timeString)
+                let speed = Number(getParamValue(timeSeries, ['wind_speed','ws'], undefined));
+                let dir = Number(getParamValue(timeSeries, ['wind_from_direction','wd'], undefined));
+                let gust = Number(getParamValue(timeSeries, ['wind_speed_of_gust','i10fg','gust'], undefined));
+                let temp = Number(getParamValue(timeSeries, ['air_temperature','2t','t'], undefined));
+                if(!Number.isFinite(speed) || !Number.isFinite(dir) || !Number.isFinite(gust) || !Number.isFinite(temp)) continue;
                 let direction = 0;
                 let factor = 1;
                 if(((1 <= dir) && (dir <= 45)) || ((315 <= dir) && (dir <= 360))) {
@@ -2366,7 +2393,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                     factor = config.weather.wind_factor_e;
                 }
                 let v = Math.pow(speed, 0.16);
-                feel = Number((13.12+(0.6215*temp)-(13.956*v)+(0.48669*temp*v)).toFixed(2));
+                let feel = Number((13.12+(0.6215*temp)-(13.956*v)+(0.48669*temp*v)).toFixed(2));
                 if(feel>0) {
                     feel = Number((feel/factor).toFixed(2));
                     if(feel>temp) {
@@ -2436,14 +2463,17 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
             let lat = config.home.lat;
             nibe.log(`Koordinater: (Latitud: ${config.home.lat}, Longitud: ${config.home.lon})`,'weather','debug');
             if(lon!==undefined && lat!==undefined && lon!="" && lat!="") {
-                https.get(`https://opendata-download-metfcst.smhi.se/api/category/pmp3g/version/2/geotype/point/lon/${lon}/lat/${lat}/data.json`, (resp) => {
+                let hours = Number(config.home['hours_'+val.system]);
+                if(!Number.isFinite(hours) || hours < 0) hours = 0;
+                const tsCount = Math.max(49, hours + 1);
+                const weatherUrl = `https://opendata-download-metfcst.smhi.se/api/category/snow1g/version/1/geotype/point/lon/${lon}/lat/${lat}/data.json?timeseries=${tsCount}&parameters=air_temperature,wind_speed,wind_from_direction,wind_speed_of_gust,symbol_code`;
+                https.get(weatherUrl, (resp) => {
                     let data = '';
                     resp.on('data', (chunk) => {
                     data += chunk;
                     });
                     resp.on('end', () => {
                         if(resp.statusCode===200) {
-                            let hours = config.home['hours_'+val.system];
                             let time = Number((Date.now()).toFixed())+(hours*3600000);
                             const astro = suncalc({lat:lat,lon:lon,timestamp:time})
                             var sunrise = toTimestamp(astro.sunrise)/1000;
@@ -2457,14 +2487,49 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                 nibe.log(`När prognosen infaller är det inte dag.`,'weather','debug');
                                 sun = false;
                             }
-                            data = JSON.parse(data);
+                            try {
+                                data = JSON.parse(data);
+                            } catch(err) {
+                                nibe.log(`Kunde inte tolka svar från SMHI: ${err.message}`,'weather','error');
+                                if(weatherOffset[val.system]!==0) {
+                                    nibe.log(`Sätter kurvjustering till 0`,'weather','debug');
+                                    curveAdjust('weather',val.system,0);
+                                    weatherOffset[val.system] = 0;
+                                }
+                                saveDataGraph('weather_offset_'+val.system,timeNow,0,true);
+                                return;
+                            }
+                            if(!data || !Array.isArray(data.timeSeries) || data.timeSeries.length===0) {
+                                nibe.log(`SMHI svarade utan prognosdata`,'weather','error');
+                                if(weatherOffset[val.system]!==0) {
+                                    nibe.log(`Sätter kurvjustering till 0`,'weather','debug');
+                                    curveAdjust('weather',val.system,0);
+                                    weatherOffset[val.system] = 0;
+                                }
+                                saveDataGraph('weather_offset_'+val.system,timeNow,0,true);
+                                return;
+                            }
+                            if(hours > (data.timeSeries.length-1)) hours = (data.timeSeries.length-1);
                             let wind = checkWind(data.timeSeries,hours);
                             let windSet = wind.feel;
-                            var tempPredicted = data.timeSeries[hours].parameters.find(tempPredicted => tempPredicted.name == "t");
-                            var tempNow = data.timeSeries[0].parameters.find(tempNow => tempNow.name == "t");
-                            var weatherPredicted = data.timeSeries[hours].parameters.find(weatherPredicted => weatherPredicted.name == "Wsymb2");
-                            tempPredicted = tempPredicted.values[0];
-                            weatherPredicted = Number(weatherPredicted.values[0]);
+                            const timeSeriesNow = data.timeSeries[0];
+                            const timeSeriesLater = data.timeSeries[hours];
+                            const timeNowString = getTimeString(timeSeriesNow);
+                            const timeLaterString = getTimeString(timeSeriesLater);
+                            var tempPredicted = Number(getParamValue(timeSeriesLater, ['air_temperature','2t','t'], undefined));
+                            var tempNow = Number(getParamValue(timeSeriesNow, ['air_temperature','2t','t'], undefined));
+                            var weatherPredicted = Number(getParamValue(timeSeriesLater, ['symbol_code','Wsymb2'], 0));
+                            if(!Number.isFinite(tempPredicted) || !Number.isFinite(tempNow) || timeNowString===undefined || timeLaterString===undefined) {
+                                nibe.log(`SMHI svarade utan temperaturdata`,'weather','error');
+                                if(weatherOffset[val.system]!==0) {
+                                    nibe.log(`Sätter kurvjustering till 0`,'weather','debug');
+                                    curveAdjust('weather',val.system,0);
+                                    weatherOffset[val.system] = 0;
+                                }
+                                saveDataGraph('weather_offset_'+val.system,timeNow,0,true);
+                                return;
+                            }
+                            const tempPredictedRaw = tempPredicted;
                             var sunFactor = 0;
                             if(config.weather.sun_enable!==undefined && config.weather.sun_enable===true) {
                                 nibe.log(`Solfaktor aktiverad`,'weather','debug');
@@ -2494,11 +2559,50 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                         nibe.setConfig(config);
                                     }
                                     if(config.weather.forecast_adjust===true) {
-                                        val.unfiltredTemp = {payload:tempPredicted,timestamp:toTimestamp(data.timeSeries[hours].validTime)};
-                                        saveDataGraph('weather_unfilterd_'+val.system,toTimestamp(data.timeSeries[hours].validTime),tempPredicted,true)
-                                        tempPredicted = Number(((outside-(tempNow.values[0]))+tempPredicted).toFixed(2));
-                                        if(windSet!==undefined) windSet = Number(((outside-tempNow.values[0])+windSet).toFixed(2));
+                                        val.unfiltredTemp = {payload:tempPredictedRaw,timestamp:toTimestamp(timeLaterString)};
+                                        tempPredicted = Number(((outside-tempNow)+tempPredicted).toFixed(2));
+                                        if(windSet!==undefined) windSet = Number(((outside-tempNow)+windSet).toFixed(2));
                                     }
+
+                                    const rawForecastGraph = [];
+                                    const adjustedForecastGraph = [];
+                                    const curveLimit = Math.min(data.timeSeries.length, Math.max(1, hours + 1));
+                                    for(let i = 0; i < curveLimit; i++) {
+                                        const curveTimeSeries = data.timeSeries[i];
+                                        const curveTimeString = getTimeString(curveTimeSeries);
+                                        const curveTemp = Number(getParamValue(curveTimeSeries, ['air_temperature','2t','t'], undefined));
+                                        if(curveTimeString===undefined || !Number.isFinite(curveTemp)) continue;
+                                        const curveTimestamp = toTimestamp(curveTimeString);
+                                        rawForecastGraph.push({x:curveTimestamp,y:curveTemp});
+                                        let adjustedCurveTemp = curveTemp;
+                                        if(config.weather.forecast_adjust===true) {
+                                            adjustedCurveTemp = Number(((outside-tempNow)+curveTemp).toFixed(2));
+                                        }
+                                        adjustedForecastGraph.push({x:curveTimestamp,y:adjustedCurveTemp});
+                                    }
+                                    rawForecastGraph.sort((a, b) => (a.x > b.x) ? 1 : -1);
+                                    adjustedForecastGraph.sort((a, b) => (a.x > b.x) ? 1 : -1);
+                                    if(rawForecastGraph.length>0) {
+                                        const rawName = 'weather_unfilterd_'+val.system;
+                                        const rawHistory = (Array.isArray(savedGraph[rawName]) ? savedGraph[rawName] : []).filter(point => point.x < timeNow);
+                                        savedGraph[rawName] = rawHistory.concat(rawForecastGraph).sort((a, b) => (a.x > b.x) ? 1 : -1);
+                                        savedData['weather_unfilterd_'+val.system] = {
+                                            data:tempPredictedRaw,
+                                            raw_data:tempPredictedRaw,
+                                            timestamp:toTimestamp(timeLaterString)
+                                        }
+                                    }
+                                    if(adjustedForecastGraph.length>0) {
+                                        const adjustedName = 'weather_forecast_'+val.system;
+                                        const adjustedHistory = (Array.isArray(savedGraph[adjustedName]) ? savedGraph[adjustedName] : []).filter(point => point.x < timeNow);
+                                        savedGraph[adjustedName] = adjustedHistory.concat(adjustedForecastGraph).sort((a, b) => (a.x > b.x) ? 1 : -1);
+                                        savedData['weather_forecast_'+val.system] = {
+                                            data:tempPredicted,
+                                            raw_data:tempPredicted,
+                                            timestamp:toTimestamp(timeLaterString)
+                                        }
+                                    }
+
                                     if(config.weather.wind_enable!==undefined && config.weather.wind_enable===true) {
                                         nibe.log(`Vindstyrning aktiverad. Köldeffekt: ${windSet} grader`,'weather','debug');
                                         setOffset = Number(((outside-windSet-sunFactor)*(heatcurve*1.2/10)/((heatcurve/10)+1)).toFixed(2));
@@ -2523,9 +2627,8 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                     val.windGraph = wind.graph;
                                     val.weatherOffset = setOffset;
                                     weatherOffset[val.system] = setOffset;
-                                    val.predictedNow = {payload:tempNow.values[0],timestamp:toTimestamp(data.timeSeries[0].validTime)};
-                                    val.predictedLater = {payload:tempPredicted,timestamp:toTimestamp(data.timeSeries[hours].validTime)};
-                                    saveDataGraph('weather_forecast_'+val.system,toTimestamp(data.timeSeries[hours].validTime),tempPredicted,true);
+                                    val.predictedNow = {payload:tempNow,timestamp:toTimestamp(timeNowString)};
+                                    val.predictedLater = {payload:tempPredicted,timestamp:toTimestamp(timeLaterString)};
                                     nibe.log(`Sparar värde för prognos. (${tempPredicted} grader)`,'weather','debug');
                                     saveDataGraph('weather_offset_'+val.system,timeNow,val.weatherOffset,true);
                                     nibe.log(`Sparar värde för kurvjustering. (${val.weatherOffset})`,'weather','debug');
@@ -3334,7 +3437,7 @@ function optimizeElectricityTrading(priceData, options = {}) {
 // # SLUT: Algoritm                                                 #
 // ##################################################################
 
-// runPrice, nu med 15-min stöd. Priset för 4 kvartar räknas om till medelvärde för en timme.
+// runPrice, nu med 15-min stöd och dynamisk hantering av sommar-/vintertid
 async function runPrice(data,array) {
 
     nibe.log(`Startar elprisreglering runPrice()`,'price','debug');
@@ -3404,33 +3507,34 @@ async function runPrice(data,array) {
                     nibe.log('Ingen prisdata alls tillgänglig.', 'price', 'warn');
                     return;
                 }
+                
                 // ##################################################################
                 // # START: Logik för att konvertera kvartspriser till timpriser    #
                 // ##################################################################
                 const hourlyPriceList = [];
+                // Gruppera hela objekt (inte bara priset) för att komma åt tidsstämpeln senare
                 const groupedByHour = quarterlyPriceList.reduce((acc, price) => {
                     const hour = price.startsAt.substring(0, 13); // "2025-09-30T10"
                     if (!acc[hour]) {
                         acc[hour] = [];
                     }
-                    acc[hour].push(price.total);
+                    acc[hour].push(price); 
                     return acc;
                 }, {});
-                // Hämta offset för serverns tid (t.ex. ger -60 minuter för UTC+1)
-                const offset = -new Date().getTimezoneOffset();
-                const sign = offset >= 0 ? '+' : '-';
-                const pad = num => String(Math.abs(num)).padStart(2, '0');
-                const hoursOffset = Math.floor(Math.abs(offset) / 60);
-                const minsOffset = Math.abs(offset) % 60;
-                const timezoneString = `${sign}${pad(hoursOffset)}:${pad(minsOffset)}`;
 
 
 
                 for (const hour in groupedByHour) {
-                    const pricesInHour = groupedByHour[hour];
-                    const averagePrice = pricesInHour.reduce((sum, p) => sum + p, 0) / pricesInHour.length;
+                    const itemsInHour = groupedByHour[hour];
+                    // Beräkna snittet
+                    const averagePrice = itemsInHour.reduce((sum, p) => sum + p.total, 0) / itemsInHour.length;
+                    
+                    // Dynamisk tidszon: Hämta slutet på datumsträngen från första kvarten i timmen
+                    // Exempel in: "2025-11-25T10:00:00.000+01:00" -> Vi tar ".000+01:00"
+                    const timeZoneSuffix = itemsInHour[0].startsAt.slice(19);
+
                     hourlyPriceList.push({
-                        startsAt: `${hour}:00:00.000${timezoneString}`,
+                        startsAt: `${hour}:00:00${timeZoneSuffix}`,
                         total: averagePrice
                     });
                 }
@@ -3561,9 +3665,9 @@ try {
 
                 data.heat_price_level = { data: heat.level, raw_data: heat.level };
                 data.hw_price_level = { data: hw.level, raw_data: hw.level };
-
-                nibe.log(`Lokal AI analys klar. Nivå: ${heat.level}, Pris: ${data.price_current.data} öre`, 'price', 'debug');
-
+                
+                nibe.log(`Lokal analys klar. Nivå: ${heat.level}, Pris: ${data.price_current.data} öre`, 'price', 'debug');
+                
                 var prio_add_enable = await getNibeData(hP['prio_add_enable']).catch(() => {});
 
                 if(prio_add_enable!==undefined) {
@@ -3670,29 +3774,29 @@ try {
 
                 // Steg 2: Medelvärdesbilda kvartspriser till timpriser
                 const hourlyPriceList = [];
+                // Gruppera hela objekt (inte bara priset) för att komma åt tidsstämpeln senare
                 const groupedByHour = rawPriceList.reduce((acc, price) => {
                     const hour = price.time_start.substring(0, 13);
                     if (!acc[hour]) {
                         acc[hour] = [];
                     }
-                    acc[hour].push(price.SEK_per_kWh);
+                    acc[hour].push(price); // Spara hela objektet
                     return acc;
                 }, {});
-                // Hämta offset för serverns tid (t.ex. ger -60 minuter för UTC+1)
-                const offset = -new Date().getTimezoneOffset();
-                const sign = offset >= 0 ? '+' : '-';
-                const pad = num => String(Math.abs(num)).padStart(2, '0');
-                const hoursOffset = Math.floor(Math.abs(offset) / 60);
-                const minsOffset = Math.abs(offset) % 60;
-                const timezoneString = `${sign}${pad(hoursOffset)}:${pad(minsOffset)}`;
 
 
 
                 for (const hour in groupedByHour) {
-                    const pricesInHour = groupedByHour[hour];
-                    const averagePrice = pricesInHour.reduce((sum, p) => sum + p, 0) / pricesInHour.length;
+                    const itemsInHour = groupedByHour[hour];
+                    // Beräkna snittet
+                    const averagePrice = itemsInHour.reduce((sum, p) => sum + p.SEK_per_kWh, 0) / itemsInHour.length;
+                    
+                    // Dynamisk tidszon: Hämta tidszonssuffixet från det första objektet i timmen
+                    // Exempel in: "2025-11-25T10:00:00+01:00" -> Vi tar "+01:00"
+                    const timeZoneSuffix = itemsInHour[0].time_start.slice(19);
+
                     hourlyPriceList.push({
-                        startsAt: `${hour}:00:00.000${timezoneString}`,
+                        startsAt: `${hour}:00:00${timeZoneSuffix}`,
                         total: averagePrice
                     });
                 }
@@ -5728,4 +5832,4 @@ const checkTranslation = (node) => {
 
     RED.nodes.registerType("nibe-config",nibeConfig);
 
-}
+}
