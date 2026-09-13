@@ -5728,4 +5728,4 @@ const checkTranslation = (node) => {
 
     RED.nodes.registerType("nibe-config",nibeConfig);
 
-}
+}

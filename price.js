@@ -118,4 +118,4 @@ module.exports = function(RED) {
         });
     }
     RED.nodes.registerType("nibe-price",nibePrice);
-}
+}
