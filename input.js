@@ -51,7 +51,13 @@ module.exports = function(RED) {
             }
             node.send([null,{topic:data.from,payload:data.message}]);
         })
-    } else {
+    } else if(config.name.toLowerCase()!=="config") {
+        // A node named "config" would otherwise subscribe to the 'config' event
+        // twice: once here, because register === "config", and again below. This
+        // first subscription is dead anyway - its handler opens with
+        // if(register===data.register), and a config payload carries no .register,
+        // so it never fires. With ~425 such nodes across the subflow instances, the
+        // duplicate alone doubled the listener count past EventEmitter's ceiling.
         sub(register, data => {
             if(register===data.register) {
                 let saved = node.context().get(data.register);
