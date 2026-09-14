@@ -53,7 +53,7 @@
     "price_addition_info": {
       "SE": "<h2>Eget Prispåslag</h2><p>Aktivera Eget prispåslag om priset ska räkna med moms (25 %) och ett fast prispåslag från nätägaren.</p><p>Moms: läggs på spotpriset. Prispåslag: anges i öre/kWh och adderas efter moms.</p><br><p>(Behövs ej om du kör Tibber)</p>",
       "EN": "<h2>Custom price add-on</h2><p>Enable Custom price add-on if you want the price to include VAT (25 %) and a fixed surcharge from the grid operator.</p><p>VAT: applied to the spot price. Surcharge: entered in öre/kWh and added after VAT.</p><br><p>(Not needed if you use Tibber)</p>",
-      "DE": "<h2>Eigener Preisaufschlag</h2><p>Aktiviere Eigener Preisaufschlag, wenn der Preis die MwSt. (25 %) und einen festen Netzaufschlag enthalten soll.</p><p>MwSt.: wird auf den Spotpreis angewendet. Aufschlag: in Öre/kWh angegeben und nach der MwSt. hinzugefügt.</p><br><p>(Nicht n�tig, wenn du Tibber verwendest)</p>"
+      "DE": "<h2>Eigener Preisaufschlag</h2><p>Aktiviere Eigener Preisaufschlag, wenn der Preis die MwSt. (25 %) und einen festen Netzaufschlag enthalten soll.</p><p>MwSt.: wird auf den Spotpreis angewendet. Aufschlag: in Öre/kWh angegeben und nach der MwSt. hinzugefügt.</p><br><p>(Nicht nötig, wenn du Tibber verwendest)</p>"
     },
     "priceadd_switch_label": {
       "SE": "<b>Aktivera eget prispåslag</b>",
@@ -201,7 +201,7 @@
     "vv_ai_threshold_info": {
       "SE": "<p>Ändrar tröskelvärdena för VV-läge. Original inställningarna är:</p><p>Ingen VV → ECO-gräns: 1<br>ECO → NORMAL-gräns: 3<br>NORMAL → LYX-gräns: 6<br>Peak värden → Vid spridda VV uttag vad som klassas som ett Eget uttag: 3</p>",
       "EN": "<p>Changes the threshold values for HW modes. The original values in the backend are:</p><p>no HW ? ECO threshold: 1<br>ECO ? NORMAL threshold: 3<br>NORMAL ? LUX threshold: 6</p>",
-      "DE": "<p>�ndert die Schwellenwerte f�r Warmwasser-Modi. Die urspr�nglichen Backend-Werte sind:</p><p>kein WW ? ECO-Schwelle: 1<br>ECO ? NORMAL-Schwelle: 3<br>NORMAL ? LUX-Schwelle: 6</p>"
+      "DE": "<p>Ändert die Schwellenwerte für Warmwasser-Modi. Die ursprünglichen Backend-Werte sind:</p><p>kein WW ? ECO-Schwelle: 1<br>ECO ? NORMAL-Schwelle: 3<br>NORMAL ? LUX-Schwelle: 6</p>"
     },
     "vv_ai_info_min_temp": {
       "SE": "<i>Min temperaturen ställer in lägsta temp som den inte ska gå under</i>.",
@@ -728,6 +728,11 @@
       "SE": "<b>Diagnostik</b>",
       "EN": "<b>Diagnostics</b>",
       "DE": "<b>Diagnostik</b>"
+    },
+    "log_hotwater": {
+      "SE": "<b>Varmvattenreglering</b>",
+      "EN": "<b>Hot water control</b>",
+      "DE": "<b>Warmwasserregelung</b>"
     },
     "log_weather": {
       "SE": "<b>Prognosreglering</b>",
