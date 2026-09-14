@@ -5665,15 +5665,29 @@ const checkTranslation = (node) => {
                                     config.system = {};
                                     nibe.setConfig(config);
                                 }
-                                var c1 = await getNibeData('40047').catch(console.log)
-                                if(c1!==undefined && c1.data > 0) {
-                                    hP.supply_s1 = "40047";
-                                    console.log('Register 40047 found, using it for supply temp S1')
+                                // 40047 and 40071 are probes: which register carries supply
+                                // temp S1 depends on the pump model, and on models that have
+                                // neither, the request can only ever be answered with
+                                // "not in database". Ask the loaded register table instead of
+                                // firing a request whose failure is the expected result. If
+                                // the table is not populated yet, fall back to probing so the
+                                // models that do have these registers still find them.
+                                const registerTable = nibe.getRegister();
+                                const tableLoaded = Array.isArray(registerTable) && registerTable.length > 0;
+                                const hasRegister = (addr) => !tableLoaded || registerTable.some(entry => entry.register == addr);
+                                if(hasRegister('40047')) {
+                                    var c1 = await getNibeData('40047').catch(console.log)
+                                    if(c1!==undefined && c1.data > 0) {
+                                        hP.supply_s1 = "40047";
+                                        console.log('Register 40047 found, using it for supply temp S1')
+                                    }
                                 }
-                                var c2 = await getNibeData('40071').catch(console.log)
-                                if(c2!==undefined && c2.data > 0)  {
-                                    hP.supply_s1 = "40071";
-                                    console.log('Register 40071 found, using it for supply temp S1')
+                                if(hasRegister('40071')) {
+                                    var c2 = await getNibeData('40071').catch(console.log)
+                                    if(c2!==undefined && c2.data > 0)  {
+                                        hP.supply_s1 = "40071";
+                                        console.log('Register 40071 found, using it for supply temp S1')
+                                    }
                                 }
 
                                 //if(config.system.pump=="F750") hP.supply_s1 = "40047";
