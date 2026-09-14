@@ -1,10 +1,10 @@
 {
   "dependencies": {
     "nibepi": "github:anerdins/nibepi#1.2.1",
-    "node-cron": "^2.0.3",
-    "node-red-dashboard": "~3.1.5",
+    "node-cron": "^4.6.0",
+    "node-red-dashboard": "~3.6.6",
     "node-red-node-ui-list": "~0.3.6",
-    "suncalc": "^1.8.0"
+    "suncalc": "^2.0.2"
   },
   "deprecated": false,
   "description": "Node-RED NibePi, communicate with your Nibe F series heatpump with RS485 adapter.",
@@ -37,5 +37,8 @@
     "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "version": "1.2.1"
+  "version": "1.2.1",
+  "engines": {
+    "node": ">=20"
+  }
 }
