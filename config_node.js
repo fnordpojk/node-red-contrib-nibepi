@@ -2458,6 +2458,10 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                 console.log('Hämtar värmekurva manuellt.')
                 val['heatcurve_'+val.system] = await getNibeData(hP['heatcurve_'+val.system]).catch(console.log)
             }
+            if(val['heatcurve_'+val.system]===undefined) {
+                nibe.log(`Kunde inte läsa värmekurvan, hoppar över prognosreglering.`,'weather','error');
+                return;
+            }
             let heatcurve = val['heatcurve_'+val.system].data;
             nibe.log(`Aktuell värmekurva: ${heatcurve}`,'weather','debug');
             let setOffset = val.weatherOffset;
@@ -4560,6 +4564,10 @@ const lockFreq = (options) => {
                     } else {
                         var dMadd = await getNibeData(hP['dMadd']).catch(console.log);
                         var dMstart = await getNibeData(hP['dMstart']).catch(console.log);
+                        if(dMadd===undefined || dMstart===undefined) {
+                            nibe.log(`Kunde inte läsa gradminutregister, hoppar över frekvensspärr.`,'price','error');
+                            return resolve(null);
+                        }
                         dMaddstart = dMstart.data-dMadd.data
                         if(dM.data < (dMaddstart.data+50)) {
                             nibe.setData(hP['dM'],(dMaddstart.data+100));
@@ -4610,6 +4618,10 @@ const blockAdditive = (options) => {
             })
             .catch(async (err) => {
                 data.dMadd = await getNibeData(hP['dMadd']).catch(console.log);
+                if(data.dMadd===undefined || data.dMstart===undefined) {
+                    nibe.log(`Kunde inte läsa gradminutregister, hoppar över blockering av tillsats.`,'price','error');
+                    return reject(new Error('Kunde inte läsa gradminutregister'));
+                }
                 let dMaddstart = data.dMstart.data-data.dMadd.data
                 if(data.dM.data<data.dMstart.data+(-100)) {
                     nibe.setData(hP['dM'],(data.dMstart.data/2));
@@ -4650,10 +4662,18 @@ const blockAdditive = (options) => {
             bt6 = await getNibeData(hP['bt6']).catch(console.log);
             bt7 = await getNibeData(hP['bt7']).catch(console.log);
             hwMode = await getNibeData(hP['hw_mode']).catch(console.log);
+            if(hwMode===undefined) {
+                nibe.log(`Kunde inte läsa varmvattenläge, hoppar över varmvattenreglering.`,'hw','error');
+                return;
+            }
             hwStopTemp = await getNibeData(hP['hw_stop_'+hwMode.raw_data]).catch(console.log);
             data.bt6 = bt6;
             data.bt7 = bt7;
             data.hwMode = hwMode;
+            if(hwStopTemp===undefined) {
+                nibe.log(`Kunde inte läsa stopptemperatur för varmvatten, hoppar över.`,'hw','error');
+                return;
+            }
             hwStopTemp.data = hwStopTemp.data-1;
             data.hwStopTemp = hwStopTemp;
             saveDataGraph('hw_stop_temp',time,hwStopTemp.data,true);
@@ -4720,6 +4740,10 @@ const blockAdditive = (options) => {
         }
         if(config.hotwater.enable_hw_priority===true) {
             hwStartTemp = await getNibeData(hP['hw_start_'+hwMode.data]).catch(console.log);
+            if(hwStartTemp===undefined) {
+                nibe.log(`Kunde inte läsa starttemperatur för varmvatten, hoppar över.`,'hw','error');
+                return;
+            }
             hwStartTemp.timestamp = time;
             if(hwON.raw_data!==4) {
                 if(bt7.data<=hwStartTemp.data) {
@@ -4893,6 +4917,10 @@ async function runFanOrginal() {
         if(data.dMaddstart===undefined) {
             data.dMaddstart = {}
             data.dMadd = await getNibeData(hP['dMadd']).catch(console.log);
+            if(data.dMstart===undefined || data.dMadd===undefined) {
+                nibe.log(`Kunde inte läsa gradminutregister, hoppar över boostkontroll.`,'fan','error');
+                return reject(new Error('Kunde inte läsa gradminutregister'));
+            }
             data.dMaddstart.data = data.dMstart.data-data.dMadd.data
             data.dMaddstart.raw_data = data.dMstart.raw_data-data.dMadd.raw_data
         }
@@ -4911,6 +4939,10 @@ async function runFanOrginal() {
             var lock_freq_1 = await getNibeData(hP['lock_freq_1_activate']).catch(console.log);
             var lock_freq_2 = await getNibeData(hP['lock_freq_2_activate']).catch(console.log);
 
+            if(lock_freq_1===undefined || lock_freq_2===undefined) {
+                nibe.log(`Kunde inte läsa spärrbandsregister, hoppar över boostkontroll.`,'fan','error');
+                return reject(new Error('Kunde inte läsa spärrbandsregister'));
+            }
             if(data.dM.data<boost && lock_freq_1.data===0 && lock_freq_2.data===0) {
                 nibe.log(`Gradminuter under gränsvärde för boost: ${boost}, Gradminuter: ${data.dM.data}`,'fan','debug');
                 if(data.alarm.raw_data!==183) {
