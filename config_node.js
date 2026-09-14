@@ -47,6 +47,10 @@ module.exports = function(RED) {
     // a mounted volume in the Docker setup.
     const VV_AI_STORE_DIR = process.env.NIBEPI_CONFIG_DIR || '/etc/nibepi';
     const VV_AI_STORE_FILE = path.join(VV_AI_STORE_DIR, 'vv_ai_profile.json');
+    // Where it used to live, for the one-time migration below. On a bare Pi this
+    // path is persistent, so existing installs have a real learned profile here.
+    const VV_AI_LEGACY_FILE = path.join(__dirname, 'vv_ai_profile.json');
+    let vvAiMigrationChecked = false;
     let vvAiStore = null;
     let vvAiPriceCache = null; // VV-AI: prislista i RAM (ingen SD-skrivning)
     let vvLastBt6 = null;
@@ -64,6 +68,26 @@ module.exports = function(RED) {
 
 
     function ensureVvAiStore() {
+        // One-time migration from the old location. Only runs when the new file is
+        // absent, so it never overwrites a profile already learned at the new path.
+        // The old file is left in place as a fallback rather than deleted - on a
+        // read-only SD card the delete would fail anyway.
+        if (!vvAiMigrationChecked) {
+            vvAiMigrationChecked = true;
+            try {
+                if (VV_AI_LEGACY_FILE !== VV_AI_STORE_FILE &&
+                    !fs.existsSync(VV_AI_STORE_FILE) && fs.existsSync(VV_AI_LEGACY_FILE)) {
+                    const legacy = fs.readFileSync(VV_AI_LEGACY_FILE, 'utf8');
+                    const parsed = JSON.parse(legacy);
+                    if (parsed && Array.isArray(parsed.profile) && parsed.profile.length === 168) {
+                        fs.writeFileSync(VV_AI_STORE_FILE, legacy, 'utf8');
+                        nibe.log(`VV-AI: flyttade inlarningsprofilen till ${VV_AI_STORE_FILE}`, 'hotwater', 'info');
+                    }
+                }
+            } catch (err) {
+                nibe.log(`VV-AI migration error: ${err}`, 'hotwater', 'error');
+            }
+        }
         if (vvAiStore && Array.isArray(vvAiStore.profile) && vvAiStore.profile.length === 168) {
             if (!Array.isArray(vvAiStore.tempPlan) || vvAiStore.tempPlan.length !== 168) {
                 vvAiStore.tempPlan = new Array(168).fill(0);
