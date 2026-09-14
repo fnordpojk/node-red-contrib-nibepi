@@ -1,7 +1,7 @@
 <!-- Copilot/AI agent instructions for node-red-contrib-nibepi -->
 # Quick Guide for AI coding agents
 
-Purpose: help an AI quickly become productive in this repository (Node-RED nodes that integrate with Nibe F-series heatpumps via the `nibepi` core).
+Purpose: help an AI quickly become productive in this repository (Node-RED nodes that integrate with Nibe F-series heat pumps, and S-series over Modbus TCP, via the `nibepi` core).
 
 1) Big picture
 - Code implements a set of Node-RED custom nodes (prefixed `nibe-`) that communicate with the `nibepi` core module to read/write registers on Nibe heatpumps.
@@ -18,13 +18,14 @@ Purpose: help an AI quickly become productive in this repository (Node-RED nodes
 - `config_node.js` — core glue: nibepi init, `nibeData` emitter, plugin/register management (getList/initiatePlugin), MQTT integration.
 - `input.js`, `output.js`, `request.js` — representative node runtime patterns and message shapes. See `input.js` for the two-output pattern and `node.status` usage.
 - `*.html` — editor UI definitions for each node (controls saved in node's `config` object).
-- `language-EN.json`, `language-SE.json`, `translate.json` — UI text/translation usage.
+- `language-EN.json`, `language-SE.json`, `language-DE.json`, `translate.json` — UI text/translation usage.
 
 4) Project-specific conventions and patterns
 - Node naming: all nodes use the `nibe-` prefix and are registered via `RED.nodes.registerType("nibe-<name>", ...)`.
 - Config node exposes `server.nibe` (API wrapper) and `server.nibeData` (EventEmitter). Nodes access them using `RED.nodes.getNode(config.server)` and then `server.nibeData.on(...)`.
 - Registers: many files reference register names via `server.hP()` lookup — the config node maintains register -> numeric mapping. When authoring a node, prefer using `server.hP()[config.name]` when available.
 - Two-output pattern: some nodes return [changedOnly, always] outputs. Follow `input.js` pattern when adding similar behavior.
+- Event cleanup: a node that subscribes to `server.nibeData` must release exactly its own listeners when it closes. The pattern is a local `__subs` array and a `sub(ev, fn)` helper, undone in `this.on('close', ...)` — see `input.js`. Ten node files use it. Never use `removeAllListeners()`: the emitter is shared, so it also wipes every other node's subscriptions.
 
 5) Developer workflows (how to run / test changes locally)
 - This repo is a Node-RED package. To test locally from Windows PowerShell:
@@ -42,9 +43,11 @@ Purpose: help an AI quickly become productive in this repository (Node-RED nodes
 6) Debugging tips
 - Node-RED logs and the Node-RED editor sidebar are the primary debug surfaces. Nodes use `node.status(...)` and emit messages to help diagnose runtime state (see `input.js`).
 - `config_node.js` extensively uses console logging and `nibeData.emit(...)` — inspect emitted event names during runtime when investigating missing events.
+- A `reqData` rejection is not always a fault. `Register (N) not in database` is the expected answer when the connected pump is not the model that node covers, and several shipped nodes are model-specific. `No respond from register (N)` is the real failure: the request went out and nothing came back.
 
 7) Integration points & external dependencies
-- `nibepi` (github:anerdins/nibepi#master) — core serial/TCP logic. Changes to protocol-level behavior live there; prefer adjusting `nibepi` for transport/serialization fixes.
+- `nibepi` (github:fnordpojk/nibepi-backend#master) — core serial/UDP/TCP logic. Changes to protocol-level behavior live there; prefer adjusting `nibepi` for transport/serialization fixes.
+- Four repositories: this one (the nodes), `fnordpojk/nibepi-backend` (the core, npm name `nibepi`), `fnordpojk/nibepi-flow` (flows and dashboard), `fnordpojk/nibepi-docker` (container packaging). Upstream `anerdins/*` is abandoned at 1.2.1.
 - Optional MQTT: config node supports `mqtt` and `mqtt_discovery` flags and publishes to the configured `mqtt_topic` (default `nibe/modbus/`).
 - UI/dashboard integration: the package depends on `node-red-dashboard` and `node-red-node-ui-list` and provides some dashboard UI in `*.html`/`*-dashboard` code.
 
@@ -57,5 +60,3 @@ Purpose: help an AI quickly become productive in this repository (Node-RED nodes
 9) What this file does NOT cover
 - Internal implementation details of `nibepi` (refer to the `nibepi` repo for transport-level logic).
 - Non-discoverable developer processes (CI or private deploy scripts) — only repo-observable workflows are included.
-
-If anything is unclear or you'd like more detail about a specific node or flow (for example `request.js` behavior or MQTT publishing calls in `config_node.js`), tell me which files to expand and I'll update this file.
