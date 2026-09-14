@@ -14,7 +14,6 @@
     "nibepi"
   ],
   "license": "MIT",
-  "main": "index.js",
   "name": "node-red-contrib-nibepi",
   "node-red": {
     "nodes": {
@@ -34,7 +33,6 @@
     }
   },
   "scripts": {
-    "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "version": "1.2.1",
