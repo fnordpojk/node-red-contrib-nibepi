@@ -39,7 +39,14 @@ module.exports = function(RED) {
     let savedGraph = {};
     let savedData = {};
 
-    const VV_AI_STORE_FILE = path.join(__dirname, 'vv_ai_profile.json');
+    // The VV-AI learning profile lives with the rest of NibePi's state, not in
+    // the installed package directory. __dirname is inside the container image,
+    // so the 168-hour profile was destroyed on every container recreate - and on
+    // a read-only SD Pi the directory is not writable at all. /etc/nibepi is the
+    // same directory the core uses for config.json and graph.json, and is already
+    // a mounted volume in the Docker setup.
+    const VV_AI_STORE_DIR = process.env.NIBEPI_CONFIG_DIR || '/etc/nibepi';
+    const VV_AI_STORE_FILE = path.join(VV_AI_STORE_DIR, 'vv_ai_profile.json');
     let vvAiStore = null;
     let vvAiPriceCache = null; // VV-AI: prislista i RAM (ingen SD-skrivning)
     let vvLastBt6 = null;
