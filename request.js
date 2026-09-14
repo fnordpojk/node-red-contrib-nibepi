@@ -3,6 +3,7 @@ module.exports = function(RED) {
         RED.nodes.createNode(this,config);
         var timer;
         var reqOn = false;
+        var absentReported = false;
         this.server = RED.nodes.getNode(config.server);
         let nibe = this.server.nibe;
         const suncalc = this.server.suncalc;
@@ -47,8 +48,20 @@ module.exports = function(RED) {
                                 this.status({ fill: 'yellow', shape: 'dot', text: `` });
                             }, 10000);
                         }).catch((err) => {
-                            console.log(err)
-                            this.status({ fill: 'red', shape: 'dot', text: `Could not get data.` });
+                            const message = (err!==undefined && err!==null && err.message!==undefined) ? err.message : String(err);
+                            // These nodes cover several pump models, so the ones for
+                            // other models permanently miss on this one. Say that once
+                            // instead of logging a raw Error object every trigger.
+                            if(message.indexOf('not in database')!==-1) {
+                                if(absentReported===false) {
+                                    absentReported = true;
+                                    this.warn(`Register ${register} is not available on this heat pump model`);
+                                }
+                                this.status({ fill: 'grey', shape: 'ring', text: `Not on this model` });
+                            } else {
+                                console.log(message)
+                                this.status({ fill: 'red', shape: 'dot', text: `Could not get data.` });
+                            }
                         })
                         timer = setTimeout(() => {
                             reqOn = false;
