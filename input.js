@@ -3,6 +3,16 @@ module.exports = function(RED) {
     function nibeInput(config) {
         RED.nodes.createNode(this,config);
         const server = RED.nodes.getNode(config.server);
+        // Track this node's own subscriptions so close() can release exactly
+        // those. They were previously either never removed (leaking on every
+        // redeploy) or cleared with removeAllListeners(), which also wiped every
+        // other node's subscriptions from the shared emitter.
+        const __subs = [];
+        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
+        this.on('close', function() {
+            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
+            __subs.length = 0;
+        });
         const nibe = server.nibe;
         var savedError = {};
         if(config.add===true && config.name.toLowerCase()!="config" && config.name.toLowerCase()!="error") {
@@ -12,14 +22,14 @@ module.exports = function(RED) {
         if(server.hP()[config.name]!==undefined) {
             register = server.hP()[config.name]
         }
-        server.nibeData.on('ready', data => {
+        sub('ready', data => {
             if(server.hP()[config.name]!==undefined) {
                 register = server.hP()[config.name]
             }
         })
         var node = this;
         if(config.name=="") {
-            server.nibeData.on('data', data => {
+            sub('data', data => {
                 let saved = node.context().get(data.register);
                 if(data.error!==undefined) {
                     
@@ -34,7 +44,7 @@ module.exports = function(RED) {
                 }
         })
     } else if(config.name.toLowerCase()=="error") {
-        server.nibeData.on('fault', data => {
+        sub('fault', data => {
             if(savedError.from!==data.from || savedError.message!==data.message) {
                 node.send({topic:data.from,payload:data.message});
                 savedError = data;
@@ -42,7 +52,7 @@ module.exports = function(RED) {
             node.send([null,{topic:data.from,payload:data.message}]);
         })
     } else {
-        server.nibeData.on(register, data => {
+        sub(register, data => {
             if(register===data.register) {
                 let saved = node.context().get(data.register);
                 if(data.error!==undefined) {
@@ -64,7 +74,7 @@ module.exports = function(RED) {
                 node.status({ fill: 'red', shape: 'dot', text: data });
         })*/
     if(config.name.toLowerCase()=="config") {
-        server.nibeData.on('config', data => {
+        sub('config', data => {
             node.send([{topic:"config",payload:data},null]);
         })
         server.nibe.getConfig();

@@ -21,6 +21,16 @@ module.exports = function (RED) {
 
         // Frsk koppla mot nibe-config s vi kan lyssna p backend-eventet
         const server = RED.nodes.getNode(config.server);
+        // Track this node's own subscriptions so close() can release exactly
+        // those. They were previously either never removed (leaking on every
+        // redeploy) or cleared with removeAllListeners(), which also wiped every
+        // other node's subscriptions from the shared emitter.
+        const __subs = [];
+        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
+        this.on('close', function() {
+            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
+            __subs.length = 0;
+        });
         let backendListener = null;
 
         if (server && server.nibeData && typeof server.nibeData.on === "function") {
@@ -57,7 +67,7 @@ module.exports = function (RED) {
                 node.send(msg);
             };
 
-            server.nibeData.on("pluginHotwaterAI", backendListener);
+            sub("pluginHotwaterAI", backendListener);
         }
 
         node.on("input", function (msg, send, done) {

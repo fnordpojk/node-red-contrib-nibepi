@@ -3,6 +3,16 @@ module.exports = function(RED) {
     function nibeRMU(config) {
         RED.nodes.createNode(this,config);
         const server = RED.nodes.getNode(config.server);
+        // Track this node's own subscriptions so close() can release exactly
+        // those. They were previously either never removed (leaking on every
+        // redeploy) or cleared with removeAllListeners(), which also wiped every
+        // other node's subscriptions from the shared emitter.
+        const __subs = [];
+        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
+        this.on('close', function() {
+            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
+            __subs.length = 0;
+        });
         
         const startUp = () => {
             let system = config.system.replace('s','S');
@@ -66,11 +76,11 @@ module.exports = function(RED) {
         if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
             startUp();
         } else {
-            server.nibeData.on('ready', (data) => {
+            sub('ready', (data) => {
                 startUp();
             })
         }
-        server.nibeData.on(this.id, (data) => {
+        sub(this.id, (data) => {
             if(data.changed===true) {
                 config.system = data.system;
                 if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
@@ -78,7 +88,7 @@ module.exports = function(RED) {
                 }
             }
         })
-        server.nibeData.on('pluginRMU', (data) => {
+        sub('pluginRMU', (data) => {
             if(data.system===config.system) {
                 this.send({topic:"Inomhustemperatur",payload:data.rmuSensor.data});
             }
@@ -86,7 +96,6 @@ module.exports = function(RED) {
 
         this.on('close', function() {
             let system = config.system.replace('s','S');
-            server.nibeData.removeAllListeners();
             this.status({ fill: 'yellow', shape: 'dot', text: `RMU 40 ${system}` });
         });
     }

@@ -4,6 +4,16 @@ module.exports = function(RED) {
         RED.nodes.createNode(this,config);
         let node = this;
         const server = RED.nodes.getNode(config.server);
+        // Track this node's own subscriptions so close() can release exactly
+        // those. They were previously either never removed (leaking on every
+        // redeploy) or cleared with removeAllListeners(), which also wiped every
+        // other node's subscriptions from the shared emitter.
+        const __subs = [];
+        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
+        this.on('close', function() {
+            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
+            __subs.length = 0;
+        });
         async function startUp() {
             let system = config.system.replace('s','S');
             let conf = server.nibe.getConfig();
@@ -69,11 +79,11 @@ module.exports = function(RED) {
         if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
             startUp();
         } else {
-            server.nibeData.on('ready', (data) => {
+            sub('ready', (data) => {
                 startUp();
             })
         }
-        server.nibeData.on(node.id, (data) => {
+        sub(node.id, (data) => {
             if(data.changed===true) {
                 config.system = data.system;
                 if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
@@ -81,7 +91,7 @@ module.exports = function(RED) {
                 }
             }
         })
-        server.nibeData.on('pluginIndoor', (data) => {
+        sub('pluginIndoor', (data) => {
             if(data.system===config.system) {
                 let outside = data['outside'];
                 let inside = data.indoorSensor;
@@ -100,7 +110,6 @@ module.exports = function(RED) {
 
         node.on('close', function() {
             let system = config.system.replace('s','S');
-            server.nibeData.removeAllListeners();
             node.status({ fill: 'yellow', shape: 'dot', text: `System ${system}` });
         });
     }

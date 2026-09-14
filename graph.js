@@ -3,6 +3,16 @@ module.exports = function(RED) {
     function nibeGraph(config) {
         RED.nodes.createNode(this,config);
         const server = RED.nodes.getNode(config.server);
+        // Track this node's own subscriptions so close() can release exactly
+        // those. They were previously either never removed (leaking on every
+        // redeploy) or cleared with removeAllListeners(), which also wiped every
+        // other node's subscriptions from the shared emitter.
+        const __subs = [];
+        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
+        this.on('close', function() {
+            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
+            __subs.length = 0;
+        });
         let node = this;
         let timeFrame;
         let translate = server.translate.dash;
@@ -212,10 +222,10 @@ module.exports = function(RED) {
             }
             
         });
-        server.nibeData.on('updateGraph', () => {
+        sub('updateGraph', () => {
             updateData();
         });
-        server.nibeData.on(this.id, (data) => {
+        sub(this.id, (data) => {
             if(data.changed===true) {
                 config.system = data.system;
             }
@@ -286,7 +296,6 @@ module.exports = function(RED) {
         }
         node.on('close', function() {
             let system = config.system.replace('s','S');
-            server.nibeData.removeAllListeners();
             node.status({ fill: 'yellow', shape: 'dot', text: `` });
         });
     }

@@ -3,6 +3,16 @@ module.exports = function(RED) {
      function nibeWeather(config) {
         RED.nodes.createNode(this,config);
         const server = RED.nodes.getNode(config.server);
+        // Track this node's own subscriptions so close() can release exactly
+        // those. They were previously either never removed (leaking on every
+        // redeploy) or cleared with removeAllListeners(), which also wiped every
+        // other node's subscriptions from the shared emitter.
+        const __subs = [];
+        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
+        this.on('close', function() {
+            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
+            __subs.length = 0;
+        });
         let system = config.system.replace('s','S');
         const startUp = () => {
             this.status({ fill: 'yellow', shape: 'dot', text: `System ${system}` });
@@ -44,7 +54,7 @@ module.exports = function(RED) {
         if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
             startUp();
         } else {
-            server.nibeData.on('ready', (data) => {
+            sub('ready', (data) => {
                 startUp();
             })
         }
@@ -64,7 +74,7 @@ module.exports = function(RED) {
             }
             
         });
-        server.nibeData.on(this.id, (data) => {
+        sub(this.id, (data) => {
             if(data.changed===true) {
                 config.system = data.system;
                 if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
@@ -72,7 +82,7 @@ module.exports = function(RED) {
                 }
             }
         })
-        server.nibeData.on('pluginWeather', (data) => {
+        sub('pluginWeather', (data) => {
             if(data.system===config.system) {
                 let outside = data['outside'];
                 //server.nibeData.emit('forecast_1',arr,config.system);
@@ -85,7 +95,6 @@ module.exports = function(RED) {
             }
         })
         this.on('close', function() {
-            server.nibeData.removeAllListeners();
             this.status({ fill: 'yellow', shape: 'dot', text: `System ${system}` });
         });
     }
