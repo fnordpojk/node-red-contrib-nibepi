@@ -4600,42 +4600,42 @@ const blockAdditive = (options) => {
         config.price = {};
         nibe.setConfig(config);
     }
-    if(config.system.pump!=="F370" && config.system.pump!=="F470") {
-        if(options.heat < 0) {
-            if(data.dM===undefined) {
-                data.dM = await getNibeData(hP['dM']).catch(console.log);
-            }
-            getNibeData(hP['dMaddstart']).then(dMaddstart => {
-                if(data.dM.data<data.dMstart.data+(-100)) {
-                    nibe.setData(hP['dM'],(data.dMstart.data/2));
-                    nibe.log(`Återställer gradminuter`,'price','debug');
-                } else {
-                    if(data.dM.data < (dMaddstart.data+50)) {
-                        nibe.setData(hP['dM'],(dMaddstart.data+100));
-                        nibe.log(`Förhindrar gradminuter från att starta tillsats`,'price','debug');
-                    }
-                }
-            })
-            .catch(async (err) => {
-                data.dMadd = await getNibeData(hP['dMadd']).catch(console.log);
-                if(data.dMadd===undefined || data.dMstart===undefined) {
-                    nibe.log(`Kunde inte läsa gradminutregister, hoppar över blockering av tillsats.`,'price','error');
-                    return reject(new Error('Kunde inte läsa gradminutregister'));
-                }
-                let dMaddstart = data.dMstart.data-data.dMadd.data
-                if(data.dM.data<data.dMstart.data+(-100)) {
-                    nibe.setData(hP['dM'],(data.dMstart.data/2));
-                    nibe.log(`Återställer gradminuter`,'price','debug');
-                } else {
-                    if(data.dM.data < (dMaddstart.data+50)) {
-                        nibe.setData(hP['dM'],(dMaddstart.data+100));
-                        nibe.log(`Förhindrar gradminuter från att starta tillsats`,'price','debug');
-                    }
-                }
-            })
+    if(config.system.pump==="F370" || config.system.pump==="F470") return resolve(null);
+    if(!(options.heat < 0)) return resolve(null);
 
+    // Read every register this needs into locals. Previously these came from an
+    // implicit global `data` left behind by an unrelated HTTP handler, and
+    // dMstart was never fetched at all, so the function threw before doing
+    // anything useful. Callers reported that as "pump does not support this".
+    const dM = await getNibeData(hP['dM']).catch(console.log);
+    const dMstart = await getNibeData(hP['dMstart']).catch(console.log);
+    if(dM===undefined || dMstart===undefined) {
+        nibe.log(`Kunde inte läsa gradminutregister, hoppar över blockering av tillsats.`,'price','error');
+        return reject(new Error('Kunde inte läsa gradminutregister'));
+    }
+
+    // Pumps without a dMaddstart register: derive it as dMstart - dMadd, which
+    // is what the original fallback path did.
+    let dMaddstart = await getNibeData(hP['dMaddstart']).catch(() => undefined);
+    if(dMaddstart===undefined || dMaddstart.data===undefined) {
+        const dMadd = await getNibeData(hP['dMadd']).catch(console.log);
+        if(dMadd===undefined) {
+            nibe.log(`Kunde inte läsa gradminutregister, hoppar över blockering av tillsats.`,'price','error');
+            return reject(new Error('Kunde inte läsa gradminutregister'));
+        }
+        dMaddstart = { data: dMstart.data - dMadd.data };
+    }
+
+    if(dM.data < dMstart.data+(-100)) {
+        nibe.setData(hP['dM'],(dMstart.data/2));
+        nibe.log(`Återställer gradminuter`,'price','debug');
+    } else {
+        if(dM.data < (dMaddstart.data+50)) {
+            nibe.setData(hP['dM'],(dMaddstart.data+100));
+            nibe.log(`Förhindrar gradminuter från att starta tillsats`,'price','debug');
         }
     }
+    return resolve(null);
 
     });
     return promise;
