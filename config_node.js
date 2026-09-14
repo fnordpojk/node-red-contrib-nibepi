@@ -356,6 +356,12 @@ function vvAiMarkSeenToday(store, hw, idx, ts) {
     }
 
 
+    // Nattspärr för VV-plan: AI-planerad värmning får aldrig ligga mellan 00:00 och 03:00.
+    // (Min-temp-failsafe kan fortfarande trigga om du har den på.)
+    // Delas av vvAiBuildPlan och vvAiTick.
+    const VV_NIGHT_BLOCK_FROM_H = 0;
+    const VV_NIGHT_BLOCK_TO_H = 3;
+
     async function vvAiBuildPlan(store, hw) {
         try {
             if (!store) return;
@@ -372,10 +378,6 @@ function vvAiMarkSeenToday(store, hw, idx, ts) {
             const tempPlan = new Array(168).fill(0);
             const modePlan = new Array(168).fill(0);
 
-            // Nattspärr för VV-plan: AI-planerad värmning får aldrig ligga mellan 00:00 och 03:00.
-            // (Min-temp-failsafe kan fortfarande trigga om du har den på.)
-            const VV_NIGHT_BLOCK_FROM_H = 0;
-            const VV_NIGHT_BLOCK_TO_H = 3;
 
             const daySum = new Array(7).fill(0);
             const dayMax = new Array(7).fill(0);
