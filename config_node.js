@@ -1327,6 +1327,9 @@ async function vvAiTick() {
                     vvEventStartTs = ts;
                     vvEventTrough = current;
                     vvEventTroughTs = ts;
+                    nibe.log(`VV-tapp påbörjat: BT6 ${current.toFixed(1)} °C, ` +
+                        `${(vvEventPeak - current).toFixed(1)} °C under topp ${vvEventPeak.toFixed(1)} °C`,
+                        'hotwater', 'debug');
                 }
                 vvLastBt6 = current;
             } else {
@@ -1344,12 +1347,35 @@ async function vvAiTick() {
                     // Ett "tapp" som pågått 90 minuter utan en enda paus är inte en
                     // tappning utan stillestånds-/cirkulationsförlust. Stäng eventet
                     // men lär ingenting av det.
-                    const drop = (tooLong && !recovered) ? 0 : (vvEventPeak - vvEventTrough);
+                    const span = vvEventPeak - vvEventTrough;
+                    const drop = (tooLong && !recovered) ? 0 : span;
+
+                    // Loggas alltid när ett event stängs, så att man kan skilja
+                    // "inget event alls" från "event som föll under tröskeln".
+                    const durMin = Math.round((ts - (vvEventStartTs || ts)) / 60000);
+                    const why = recovered
+                        ? 'återhämtning'
+                        : (sinceNewLow >= VV_DRAW_IDLE_CLOSE_MS ? 'ingen ny botten på 4 min' : 'tidsgräns 90 min');
+                    const bt6Span = `BT6 ${vvEventPeak.toFixed(1)} → ${vvEventTrough.toFixed(1)} °C`;
+
                     if (Number.isFinite(drop) && drop >= minDrop) {
                         // Bokför tappet på den timme då botten nåddes, inte när vi
                         // råkade upptäcka att det tagit slut.
-                        registerVvDraw(hw, drop, vvEventTroughTs || ts);
+                        const learnTs = vvEventTroughTs || ts;
+                        registerVvDraw(hw, drop, learnTs);
+                        nibe.log(`VV-tapp registrerat: ${drop.toFixed(1)} °C (${bt6Span}), ` +
+                            `${durMin} min, timme ${getWeekHourIndex(learnTs)}/167, avslut: ${why}`,
+                            'hotwater', 'debug');
+                    } else if (tooLong && !recovered) {
+                        nibe.log(`VV-tapp förkastat (stillestånds-/cirkulationsförlust): ` +
+                            `${span.toFixed(1)} °C (${bt6Span}) över ${durMin} min utan paus`,
+                            'hotwater', 'debug');
+                    } else {
+                        nibe.log(`VV-tapp förkastat: ${span.toFixed(1)} °C < tröskel ${minDrop} °C ` +
+                            `(${bt6Span}), ${durMin} min, avslut: ${why}`,
+                            'hotwater', 'debug');
                     }
+
                     vvInEvent = false;
                     vvEventStartTs = null;
                     vvEventTrough = null;
