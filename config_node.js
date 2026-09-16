@@ -54,11 +54,25 @@ module.exports = function(RED) {
     let vvAiStore = null;
     let vvAiPriceCache = null; // VV-AI: prislista i RAM (ingen SD-skrivning)
     let vvLastBt6 = null;
-    let vvCurrentDrop = 0;
     let vvInEvent = false;
-    // BT6-inlärning: spåra event-längd och avsluta när tappet går långsamt (efter minst 5 min)
+    // BT6-inlärning: tappet mäts topp-till-botten över hela eventet.
     let vvEventStartTs = null;
-    let vvLowRateCount = 0; // antal tickar i rad med "långsamt tapp"
+    let vvEventPeak = null;     // högsta BT6 sedan senast avslutade event
+    let vvEventTrough = null;   // lägsta BT6 i pågående event
+    let vvEventTroughTs = null; // när bottennoteringen sattes
+
+    // Hur långt BT6 ska falla under toppen för att räknas som ett påbörjat tapp.
+    const VV_DRAW_START_DELTA = 0.3;              // °C
+    // Ingen ny bottennotering på så här länge => tappet anses avslutat.
+    const VV_DRAW_IDLE_CLOSE_MS = 4 * 60 * 1000;
+    // BT6 har stigit så här mycket över botten => återvärmning igång, avsluta.
+    const VV_DRAW_RECOVER_DELTA = 0.5;            // °C
+    // Säkerhetsbroms så att en långsam nedkylning aldrig blir ett jättetapp.
+    const VV_DRAW_MAX_MS = 90 * 60 * 1000;
+
+    // Skyddar mot överlappande vvAiTick(): cron startar en ny tick varje minut
+    // utan att invänta den förra, och alla vv*-variabler ovan är delade.
+    let vvTickRunning = false;
 
     let vvLastAiControl = false;
     let vvManualHwMode = null;
@@ -66,6 +80,27 @@ module.exports = function(RED) {
     let vvLastManualSchedule = false; // tidsstyrning VV – tidigare läge (on/off)
     let vvManualHwPeriodSchedule = null; // cache för hw_period när tidsstyrning används
 
+
+    // Dagens "sedda" timmar sparas numera till disk. Efter en omstart kan de vara
+    // trasiga eller höra till ett annat datum, så normalisera innan de används.
+    // Saknas eller är nyckeln ogiltig tas båda bort, vilket ger exakt det gamla
+    // beteendet: dygnsskiftet initieras om utan att decaya något.
+    function vvAiNormaliseSeen(store) {
+        if (!store) return;
+        store.meta = store.meta || {};
+        const m = store.meta;
+        if (typeof m.vvAiSeenTodayKey !== 'string' ||
+            !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(m.vvAiSeenTodayKey)) {
+            delete m.vvAiSeenTodayKey;
+            delete m.vvAiSeenToday;
+            return;
+        }
+        if (!Array.isArray(m.vvAiSeenToday) || m.vvAiSeenToday.length !== 168) {
+            m.vvAiSeenToday = new Array(168).fill(false);
+        } else {
+            m.vvAiSeenToday = m.vvAiSeenToday.map((v) => v === true);
+        }
+    }
 
     function ensureVvAiStore() {
         // One-time migration from the old location. Only runs when the new file is
@@ -96,6 +131,7 @@ module.exports = function(RED) {
                 vvAiStore.modePlan = new Array(168).fill(0);
             }
             vvAiStore.meta = vvAiStore.meta || {};
+            vvAiNormaliseSeen(vvAiStore);
             return vvAiStore;
         }
         try {
@@ -110,6 +146,7 @@ module.exports = function(RED) {
                     vvAiStore.modePlan = new Array(168).fill(0);
                 }
                 vvAiStore.meta = vvAiStore.meta || {};
+                vvAiNormaliseSeen(vvAiStore);
                 return vvAiStore;
             }
         } catch (err) {
@@ -167,7 +204,13 @@ module.exports = function(RED) {
 
 
 
-    function saveVvAiStore() {
+    // Skrivningen är asynkron och kan numera triggas flera gånger i samma tick
+    // (inlärt tapp + dygnsskifte). Två parallella fs.writeFile mot samma fil kan
+    // ge en trasig JSON, så skrivningarna serialiseras och görs atomiskt.
+    let vvAiWriteInFlight = false;
+    let vvAiWritePending = false;
+
+    function saveVvAiStore(force) {
         if (!vvAiStore) return;
         try {
             vvAiStore.meta = vvAiStore.meta || {};
@@ -176,8 +219,15 @@ module.exports = function(RED) {
                 ? vvAiStore.meta.lastSaveTs
                 : 0;
 
-            // Spara som mest en gång per timme för att undvika att blockera Node-RED varje minut
-            if (now - last < 60 * 60 * 1000) {
+            // Spara som mest en gång per timme för att undvika att blockera Node-RED varje minut.
+            // force=true används när ett inlärt tapp just skrivits in i profilen – den
+            // skrivningen får inte tappas bort om containern startas om inom timmen.
+            if (!force && now - last < 60 * 60 * 1000) {
+                return;
+            }
+            if (vvAiWriteInFlight) {
+                // Skriv om så fort den pågående skrivningen är klar.
+                vvAiWritePending = true;
                 return;
             }
             vvAiStore.meta.lastSaveTs = now;
@@ -197,17 +247,40 @@ module.exports = function(RED) {
             };
 
             const srcMeta = vvAiStore.meta || {};
-            const keepMetaKeys = ['lastPlanBuild', 'lastLearnTs', 'lastDropDeg', 'lastIndex'];
+            // vvAiSeenTodayKey/vvAiSeenToday MÅSTE överleva en omstart. Utan dem
+            // nollställs dagens sedda timmar, och vid nästa dygnsskifte decayas
+            // timmar som faktiskt hade tapp. lastDecayKey gör skiftet spårbart.
+            const keepMetaKeys = [
+                'lastPlanBuild', 'lastLearnTs', 'lastDropDeg', 'lastIndex',
+                'vvAiSeenTodayKey', 'vvAiSeenToday', 'lastDecayKey', 'lastDecayTs'
+            ];
             for (const key of keepMetaKeys) {
                 if (Object.prototype.hasOwnProperty.call(srcMeta, key)) {
                     persist.meta[key] = srcMeta[key];
                 }
             }
 
-            fs.writeFile(VV_AI_STORE_FILE, JSON.stringify(persist, null, 2), 'utf8', (err) => {
+            // Skriv till temporärfil och byt namn: rename i samma katalog är atomiskt,
+            // så en omstart mitt i en skrivning aldrig lämnar en halv profil på disk.
+            const tmpFile = VV_AI_STORE_FILE + '.tmp';
+            vvAiWriteInFlight = true;
+            fs.writeFile(tmpFile, JSON.stringify(persist, null, 2), 'utf8', (err) => {
                 if (err) {
+                    vvAiWriteInFlight = false;
+                    vvAiWritePending = false;
                     nibe.log(`VV-AI store write error: ${err}`, 'hotwater', 'error');
+                    return;
                 }
+                fs.rename(tmpFile, VV_AI_STORE_FILE, (err2) => {
+                    vvAiWriteInFlight = false;
+                    if (err2) {
+                        nibe.log(`VV-AI store rename error: ${err2}`, 'hotwater', 'error');
+                    }
+                    if (vvAiWritePending) {
+                        vvAiWritePending = false;
+                        saveVvAiStore(true);
+                    }
+                });
             });
         } catch (err) {
             nibe.log(`VV-AI store save error: ${err}`, 'hotwater', 'error');
@@ -333,6 +406,11 @@ module.exports = function(RED) {
             meta.vvAiSeenToday = new Array(168).fill(false);
             meta.lastDecayKey = newKey;
             meta.lastDecayTs = Date.now();
+
+            // Skriv igenom direkt. Annars ligger dygnsskiftet bara i RAM tills nästa
+            // timvisa sparning, och en omstart däremellan skulle läsa det gamla datumet
+            // och decaya samma dygn en gång till.
+            saveVvAiStore(true);
         }
 
 function vvAiMarkSeenToday(store, hw, idx, ts) {
@@ -383,7 +461,7 @@ function vvAiMarkSeenToday(store, hw, idx, ts) {
         store.meta.lastLearnTs = ts;
         store.meta.lastDropDeg = dropDeg;
         store.meta.lastIndex = idx;
-        saveVvAiStore();
+        saveVvAiStore(true);
     }
 
 
@@ -1059,6 +1137,14 @@ for (let i = 0; i < 168; i++) {
 
 
 async function vvAiTick() {
+        // Cron kör vvAiTick() utan await varje minut. En tick som drar över en
+        // minut (6 awaits mot värmepumpen) skulle annars köra parallellt med
+        // nästa och förstöra tappdetekteringens delade tillstånd.
+        if (vvTickRunning) {
+            nibe.log('VV-AI: föregående tick pågår fortfarande – hoppar över denna', 'hotwater', 'debug');
+            return;
+        }
+        vvTickRunning = true;
         try {
             const config = nibe.getConfig() || {};
             const hw = config.hotwater || {};
@@ -1203,8 +1289,11 @@ async function vvAiTick() {
             }
             if (!bt6 || bt6.data === undefined || !Number.isFinite(Number(bt6.data))) {
                 vvLastBt6 = null;
-                vvCurrentDrop = 0;
                 vvInEvent = false;
+                vvEventPeak = null;
+                vvEventTrough = null;
+                vvEventTroughTs = null;
+                vvEventStartTs = null;
                 await vvAiBuildPlan(store, hw);
             store.meta.lastTick = ts;
                 saveVvAiStore();
@@ -1214,59 +1303,59 @@ async function vvAiTick() {
             const current = Number(bt6.data);
             const minDrop = getVvMinDrop(hw);
 
-            if (vvLastBt6 === null) {
+            // Tappet mäts topp-till-botten i stället för som en summa av per-tick-deltan.
+            // Den gamla summan nollställdes av *varje* sample där BT6 inte sjönk – en platt
+            // minut, sensorbrus eller två tickar som läste samma värde räckte. Ett verkligt
+            // tapp på flera grader styckades då upp i bitar under minDrop och kastades. Nu
+            // avläses (topp - botten) över hela eventet, precis som när man läser av en
+            // BT6-graf för hand, vilket tål platta och lätt stigande samples.
+            if (vvLastBt6 === null || vvEventPeak === null) {
                 vvLastBt6 = current;
-                vvCurrentDrop = 0;
+                vvEventPeak = current;
+                vvEventTrough = null;
+                vvEventTroughTs = null;
+                vvEventStartTs = null;
                 vvInEvent = false;
+            } else if (!vvInEvent) {
+                // Utanför event: toppen följer BT6 uppåt (tanken laddas).
+                if (current > vvEventPeak) {
+                    vvEventPeak = current;
+                }
+                // Starta event när BT6 fallit märkbart under toppen.
+                if ((vvEventPeak - current) >= VV_DRAW_START_DELTA) {
+                    vvInEvent = true;
+                    vvEventStartTs = ts;
+                    vvEventTrough = current;
+                    vvEventTroughTs = ts;
+                }
+                vvLastBt6 = current;
             } else {
-                const delta = vvLastBt6 - current; // positivt = tapp (°C per tick)
-
-                if (delta > 0) {
-                    // Starta event (startvillkor/filtrering lämnas oförändrad – vi bygger vidare på befintlig logik)
-                    if (!vvInEvent) {
-                        vvInEvent = true;
-                        vvEventStartTs = ts;
-                        vvLowRateCount = 0;
-                    }
-
-                    vvCurrentDrop += delta;
-
-                    // Avsluta event baserat på "tapphastighet" efter minst 5 minuter:
-                    // - Om tappet inte längre är "aktivt" (långsamt) under flera tickar i rad => duschen är klar.
-                    if (vvInEvent && vvEventStartTs && (ts - vvEventStartTs) >= 5 * 60 * 1000) {
-                        // delta är redan per tick (typiskt 1 min). Trösklar i °C/tick.
-                        if (delta >= 0.4) {
-                            // Aktivt tapp – fortsätt
-                            vvLowRateCount = 0;
-                        } else if (delta < 0.3) {
-                            // Tappet har gått ned i "svans" – räkna tickar i rad
-                            vvLowRateCount++;
-                        } else {
-                            // Mellanzon: varken aktivt tapp eller helt klart – mjuk reset så vi kräver stabilt låg takt
-                            vvLowRateCount = Math.max(0, vvLowRateCount - 1);
-                        }
-
-                        if (vvLowRateCount >= 3) {
-                            if (vvCurrentDrop >= minDrop) {
-                                registerVvDraw(hw, vvCurrentDrop, ts);
-                            }
-                            vvCurrentDrop = 0;
-                            vvInEvent = false;
-                            vvEventStartTs = null;
-                            vvLowRateCount = 0;
-                        }
-                    }
-                } else {
-                    // BT6 sjunker inte längre (planat ut eller stiger) – avsluta event som tidigare
-                    if (vvInEvent && vvCurrentDrop >= minDrop) {
-                        registerVvDraw(hw, vvCurrentDrop, ts);
-                    }
-                    vvCurrentDrop = 0;
-                    vvInEvent = false;
-                    vvEventStartTs = null;
-                    vvLowRateCount = 0;
+                // I event: följ botten. Varje ny bottennotering håller eventet levande.
+                if (vvEventTrough === null || current < vvEventTrough) {
+                    vvEventTrough = current;
+                    vvEventTroughTs = ts;
                 }
 
+                const sinceNewLow = ts - (vvEventTroughTs || vvEventStartTs || ts);
+                const recovered = (current - vvEventTrough) >= VV_DRAW_RECOVER_DELTA;
+                const tooLong = (ts - (vvEventStartTs || ts)) >= VV_DRAW_MAX_MS;
+
+                if (recovered || sinceNewLow >= VV_DRAW_IDLE_CLOSE_MS || tooLong) {
+                    // Ett "tapp" som pågått 90 minuter utan en enda paus är inte en
+                    // tappning utan stillestånds-/cirkulationsförlust. Stäng eventet
+                    // men lär ingenting av det.
+                    const drop = (tooLong && !recovered) ? 0 : (vvEventPeak - vvEventTrough);
+                    if (Number.isFinite(drop) && drop >= minDrop) {
+                        // Bokför tappet på den timme då botten nåddes, inte när vi
+                        // råkade upptäcka att det tagit slut.
+                        registerVvDraw(hw, drop, vvEventTroughTs || ts);
+                    }
+                    vvInEvent = false;
+                    vvEventStartTs = null;
+                    vvEventTrough = null;
+                    vvEventTroughTs = null;
+                    vvEventPeak = current;
+                }
                 vvLastBt6 = current;
             }
 
@@ -1900,6 +1989,8 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
 
         } catch (err) {
             nibe.log(`VV-AI tick error: ${err}`, 'hotwater', 'error');
+        } finally {
+            vvTickRunning = false;
         }
     }
     const SunCalc = require('suncalc');
