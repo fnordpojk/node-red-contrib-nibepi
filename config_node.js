@@ -62,7 +62,13 @@ module.exports = function(RED) {
     let vvEventTroughTs = null; // när bottennoteringen sattes
 
     // Hur långt BT6 ska falla under toppen för att räknas som ett påbörjat tapp.
-    const VV_DRAW_START_DELTA = 0.3;              // °C
+    // 0.3 °C räckte för att varje steg i stilleståndsförlusten skulle öppna
+    // ett event: toppen följer bara BT6 uppåt, så en tank som kyls av ~0.5 °C/h
+    // korsade tröskeln var 40:e minut och stängde fyra minuter senare som
+    // förkastad. Vid 1.0 °C sker det var ~2:a timme i stället. Riktiga tapp
+    // påverkas inte: de två första verkliga tappen mätte 9.7 och 24.0 °C, och
+    // minDrop (3 °C) styr oförändrat vad som faktiskt lärs in.
+    const VV_DRAW_START_DELTA = 1.0;              // °C
     // Ingen ny bottennotering på så här länge => tappet anses avslutat.
     const VV_DRAW_IDLE_CLOSE_MS = 4 * 60 * 1000;
     // BT6 har stigit så här mycket över botten => återvärmning igång, avsluta.
