@@ -60,6 +60,7 @@ module.exports = function(RED) {
     let vvEventPeak = null;     // högsta BT6 sedan senast avslutade event
     let vvEventTrough = null;   // lägsta BT6 i pågående event
     let vvEventTroughTs = null; // när bottennoteringen sattes
+    let vvEventPeakTs = null;   // när BT6 senast stod på toppen
 
     // Hur långt BT6 ska falla under toppen för att räknas som ett påbörjat tapp.
     // 0.3 °C räckte för att varje steg i stilleståndsförlusten skulle öppna
@@ -69,12 +70,27 @@ module.exports = function(RED) {
     // påverkas inte: de två första verkliga tappen mätte 9.7 och 24.0 °C, och
     // minDrop (3 °C) styr oförändrat vad som faktiskt lärs in.
     const VV_DRAW_START_DELTA = 1.0;              // °C
-    // Ingen ny bottennotering på så här länge => tappet anses avslutat.
-    const VV_DRAW_IDLE_CLOSE_MS = 4 * 60 * 1000;
+    // Ingen ny bottennotering på så här länge => tappet anses avslutat. Fyra
+    // minuter styckade en kväll av oregelbunden förbrukning i fem bitar, alla
+    // under minDrop: 23 sep föll BT6 5.3 °C på 1 h 42 min och bokfördes som
+    // 1.6 + 0.6 + 0.9 + 0.4 + 1.8, varav ingenting lärdes in. Femton minuter
+    // tål pauser inom samma tappomgång.
+    const VV_DRAW_IDLE_CLOSE_MS = 15 * 60 * 1000;
     // BT6 har stigit så här mycket över botten => återvärmning igång, avsluta.
     const VV_DRAW_RECOVER_DELTA = 0.5;            // °C
-    // Säkerhetsbroms så att en långsam nedkylning aldrig blir ett jättetapp.
-    const VV_DRAW_MAX_MS = 90 * 60 * 1000;
+    // Stillestånds- och cirkulationsförlust skiljs från tappning på hastighet,
+    // inte på längd: avsvalning ligger kring 0.5 °C/h medan även ett utdraget
+    // kvällstapp ligger över 3 °C/h. Under den här gränsen lärs ingenting in.
+    const VV_DRAW_MIN_RATE = 1.5;                 // °C/h
+    // Hur länge ett event får krypa under VV_DRAW_MIN_RATE innan dess origo
+    // flyttas fram till nuläget i stället för att avsvalningen krediteras ett
+    // senare tapp.
+    const VV_DRAW_REBASE_MS = 30 * 60 * 1000;
+    // Ren säkerhetsbroms så att ett event inte kan leva hur länge som helst.
+    // Gränsen var 90 min och gjorde dubbelt arbete: den användes också för att
+    // förkasta stillestånd, och förkastade därmed verkliga kvällstapp som tagit
+    // mer än 90 minuter. Den bedömningen görs nu på VV_DRAW_MIN_RATE.
+    const VV_DRAW_MAX_MS = 360 * 60 * 1000;
 
     // Skyddar mot överlappande vvAiTick(): cron startar en ny tick varje minut
     // utan att invänta den förra, och alla vv*-variabler ovan är delade.
@@ -1297,6 +1313,7 @@ async function vvAiTick() {
                 vvLastBt6 = null;
                 vvInEvent = false;
                 vvEventPeak = null;
+                vvEventPeakTs = null;
                 vvEventTrough = null;
                 vvEventTroughTs = null;
                 vvEventStartTs = null;
@@ -1318,14 +1335,16 @@ async function vvAiTick() {
             if (vvLastBt6 === null || vvEventPeak === null) {
                 vvLastBt6 = current;
                 vvEventPeak = current;
+                vvEventPeakTs = ts;
                 vvEventTrough = null;
                 vvEventTroughTs = null;
                 vvEventStartTs = null;
                 vvInEvent = false;
             } else if (!vvInEvent) {
                 // Utanför event: toppen följer BT6 uppåt (tanken laddas).
-                if (current > vvEventPeak) {
+                if (current >= vvEventPeak) {
                     vvEventPeak = current;
+                    vvEventPeakTs = ts;
                 }
                 // Starta event när BT6 fallit märkbart under toppen.
                 if ((vvEventPeak - current) >= VV_DRAW_START_DELTA) {
@@ -1345,23 +1364,45 @@ async function vvAiTick() {
                     vvEventTroughTs = ts;
                 }
 
+                // Fallhastigheten mäts från när BT6 senast stod på toppen, inte
+                // från eventets start: spannet innehåller redan fallet som öppnade
+                // eventet, så en start-relativ hastighet blir för hög. Ett läckage
+                // på 1.2 °C/h såg då ut som 3.6 °C och lärdes in.
+                const fallMs = ts - (vvEventPeakTs || vvEventStartTs || ts);
+                const spanNow = vvEventPeak - vvEventTrough;
+                const rate = fallMs > 0 ? (spanNow / (fallMs / 3600000)) : Infinity;
+
                 const sinceNewLow = ts - (vvEventTroughTs || vvEventStartTs || ts);
                 const recovered = (current - vvEventTrough) >= VV_DRAW_RECOVER_DELTA;
                 const tooLong = (ts - (vvEventStartTs || ts)) >= VV_DRAW_MAX_MS;
 
-                if (recovered || sinceNewLow >= VV_DRAW_IDLE_CLOSE_MS || tooLong) {
-                    // Ett "tapp" som pågått 90 minuter utan en enda paus är inte en
-                    // tappning utan stillestånds-/cirkulationsförlust. Stäng eventet
-                    // men lär ingenting av det.
+                if (!recovered &&
+                    (ts - (vvEventStartTs || ts)) >= VV_DRAW_REBASE_MS &&
+                    rate < VV_DRAW_MIN_RATE) {
+                    // Eventet har krupit i en halvtimme: det är avsvalning, inte en
+                    // tappning. Flytta fram origo i stället för att stänga, annars
+                    // krediteras avsvalningen ett senare tapp - fyra timmars
+                    // stillestånd följt av en 5 °C-dusch bokfördes som 7 °C.
+                    vvEventStartTs = ts;
+                    vvEventPeak = current;
+                    vvEventPeakTs = ts;
+                    vvEventTrough = current;
+                    vvEventTroughTs = ts;
+                } else if (recovered || sinceNewLow >= VV_DRAW_IDLE_CLOSE_MS || tooLong) {
                     const span = vvEventPeak - vvEventTrough;
-                    const drop = (tooLong && !recovered) ? 0 : span;
+                    const tooSlow = rate < VV_DRAW_MIN_RATE;
+                    const drop = tooSlow ? 0 : span;
 
                     // Loggas alltid när ett event stängs, så att man kan skilja
                     // "inget event alls" från "event som föll under tröskeln".
                     const durMin = Math.round((ts - (vvEventStartTs || ts)) / 60000);
+                    const idleMin = Math.round(VV_DRAW_IDLE_CLOSE_MS / 60000);
+                    const maxMin = Math.round(VV_DRAW_MAX_MS / 60000);
                     const why = recovered
                         ? 'återhämtning'
-                        : (sinceNewLow >= VV_DRAW_IDLE_CLOSE_MS ? 'ingen ny botten på 4 min' : 'tidsgräns 90 min');
+                        : (sinceNewLow >= VV_DRAW_IDLE_CLOSE_MS
+                            ? `ingen ny botten på ${idleMin} min`
+                            : `tidsgräns ${maxMin} min`);
                     const bt6Span = `BT6 ${vvEventPeak.toFixed(1)} → ${vvEventTrough.toFixed(1)} °C`;
 
                     if (Number.isFinite(drop) && drop >= minDrop) {
@@ -1370,11 +1411,13 @@ async function vvAiTick() {
                         const learnTs = vvEventTroughTs || ts;
                         registerVvDraw(hw, drop, learnTs);
                         nibe.log(`VV-tapp registrerat: ${drop.toFixed(1)} °C (${bt6Span}), ` +
-                            `${durMin} min, timme ${getWeekHourIndex(learnTs)}/167, avslut: ${why}`,
+                            `${durMin} min, ${rate.toFixed(1)} °C/h, ` +
+                            `timme ${getWeekHourIndex(learnTs)}/167, avslut: ${why}`,
                             'hotwater', 'debug');
-                    } else if (tooLong && !recovered) {
+                    } else if (tooSlow) {
                         nibe.log(`VV-tapp förkastat (stillestånds-/cirkulationsförlust): ` +
-                            `${span.toFixed(1)} °C (${bt6Span}) över ${durMin} min utan paus`,
+                            `${span.toFixed(1)} °C (${bt6Span}) på ${durMin} min ` +
+                            `= ${rate.toFixed(1)} °C/h < ${VV_DRAW_MIN_RATE} °C/h`,
                             'hotwater', 'debug');
                     } else {
                         nibe.log(`VV-tapp förkastat: ${span.toFixed(1)} °C < tröskel ${minDrop} °C ` +
@@ -1387,6 +1430,7 @@ async function vvAiTick() {
                     vvEventTrough = null;
                     vvEventTroughTs = null;
                     vvEventPeak = current;
+                    vvEventPeakTs = ts;
                 }
                 vvLastBt6 = current;
             }
