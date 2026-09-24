@@ -1481,6 +1481,14 @@ async function vvAiTick() {
                 if (current >= vvEventPeak) {
                     vvEventPeak = current;
                     vvEventPeakTs = ts;
+                } else if (vvEventPeakTs !== null &&
+                    (ts - vvEventPeakTs) >= VV_DRAW_REBASE_MS &&
+                    ((vvEventPeak - current) / ((ts - vvEventPeakTs) / 3600000)) < VV_DRAW_REBASE_RATE) {
+                    // Mellan tappen följer toppen annars inte med när tanken svalnar,
+                    // så nästa tapp mäts mot en inaktuell topp: avsvalningen räknas in
+                    // i spannet och späder ut fallhastigheten.
+                    vvEventPeak = current;
+                    vvEventPeakTs = ts;
                 }
                 // Starta event när BT6 fallit märkbart under toppen.
                 if ((vvEventPeak - current) >= VV_DRAW_START_DELTA) {
