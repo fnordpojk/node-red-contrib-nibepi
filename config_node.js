@@ -183,7 +183,18 @@ module.exports = function(RED) {
                 return vvAiStore;
             }
         } catch (err) {
-            nibe.log(`VV-AI load error: ${err}`, 'hotwater', 'error');
+            // Att filen saknas är normaltillståndet vid första starten, och efter
+            // en avsiktlig rensning av profilen. Det är inte ett fel, och ska inte
+            // loggas som ett: writeLog lyfter en dashboard-fault för både error
+            // och info, så en tom disk gav en fault varje gång containern
+            // startade. En trasig eller oläsbar fil är däremot ett verkligt fel
+            // och ska fortsätta synas.
+            if (err && err.code === 'ENOENT') {
+                nibe.log(`VV-AI: ingen sparad profil i ${VV_AI_STORE_FILE}, ` +
+                    `börjar från en tom profil`, 'hotwater', 'debug');
+            } else {
+                nibe.log(`VV-AI load error: ${err}`, 'hotwater', 'error');
+            }
         }
         vvAiStore = {
             profile: new Array(168).fill(0),
