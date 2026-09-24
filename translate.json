@@ -789,11 +789,6 @@
       "EN": "<b>NibePi electricity price adaption</b><br><i>Activates NibePis electricity price adaption and all parameters will be managed from here.</i>",
       "DE": "<b>NibePis Strompreisregelung</b><br><i>Aktiviert NibePi's Strompreisregelung und alle Parameter werden dann hier eingestellt.</i>"
     },
-    "price_priceai_label": {
-      "SE": "<b>AI Elprisreglering</b><br><i>Aktiverar AI elprisreglering och alla parametrar ställs in här</i>",
-      "EN": "<b>AI electricity price adaption</b><br><i>Activates AI electricity price adaption and all parameters will be managed from here.</i>",
-      "DE": "<b>AI Strompreisregelung</b><br><i>Aktiviert AI's Strompreisregelung und alle Parameter werden dann hier eingestellt.</i>"
-    },
     "price_area_label": {
       "SE": "Elprisområde",
       "EN": "Electrical area code",
@@ -870,9 +865,9 @@
       "DE": "<b>Verwenden Sie Ihre eigenen Einstellungen"
     },
     "price_lowhigh_setting_info": {
-      "SE": "<b>Definera väldigt högt/lågt elpris</b><br>Definera vad du anser är ett väldigt högt elpris, eller väldigt lågt elpris. <br><i>(OBS Endast med AI)</i>",
-      "EN": "<b>Define very high/low electricity price</b><br>Define what you consider to be a very high electricity price, or a very low electricity price. <br><i>(NOTE Only with AI)</i>",
-      "DE": "<b>Sehr hohen/niedrigen Strompreis definieren</b><br>Definieren Sie einen sehr hohen Strompreis oder einen sehr niedrigen Strompreis. <br><i>(HINWEIS Nur mit AI)</i>"
+      "SE": "<b>Definera väldigt högt/lågt elpris</b><br>Definera vad du anser är ett väldigt högt elpris, eller väldigt lågt elpris. <br><i>(OBS Gäller datakällorna Tibber och Elprisetjustnu.se, inte Nibe)</i>",
+      "EN": "<b>Define very high/low electricity price</b><br>Define what you consider to be a very high electricity price, or a very low electricity price. <br><i>(NOTE Applies to the Tibber and Elprisetjustnu.se data sources, not Nibe)</i>",
+      "DE": "<b>Sehr hohen/niedrigen Strompreis definieren</b><br>Definieren Sie einen sehr hohen Strompreis oder einen sehr niedrigen Strompreis. <br><i>(HINWEIS Gilt für die Datenquellen Tibber und Elprisetjustnu.se, nicht Nibe)</i>"
     },
     "economy": {
       "SE": "Ekonomi",
@@ -935,9 +930,9 @@
       "DE": "<p><b>Wamrwassereinstellungen</b></p><br>Wähle die Wamrwassereinstellungen für die unterschiedlichen Strompreisniveaus."
     },
     "price_settings": {
-      "SE": "<p><b>Inställningar</b></p><br>Välj vilken reglering som ska gälla. Med styrning av NibePi så välj datakälla. För integrering mot Tibber, använd din personliga token som finns att hämta från https://developer.tibber.com/ eller från http://nibepi.anerdins.se för AI tjänsten.",
-      "EN": "<p><b>Settings</b></p><br>Select, which control mechanism should be used. With NibePi control, select the data source. For integration with Tibber, please use your personal access token, which can be obtained from  https://developer.tibber.com/ or from http://nibepi.anerdins.se to use with the AI service",
-      "DE": "<p><b>Einstellungen</b></p><br>Wähle aus, welcher Regelmechanismus verwendet werden soll. Für NibePi Regeleung, bitte die Datenquelle wählen. Für die Verwendung von Tibber muss ein persönliches Acces-Token verwendet werden. Dieses kist hier erhältlich: https://developer.tibber.com/ oder von http://nibepi.anerdins.se zur Verwendung mit dem KI-Dienst"
+      "SE": "<p><b>Inställningar</b></p><br>Välj vilken reglering som ska gälla. Med styrning av NibePi så välj datakälla. För integrering mot Tibber, använd din personliga token som finns att hämta från https://developer.tibber.com/. Elprisetjustnu.se behöver ingen token, bara elprisömråde — båda källorna använder samma lokala prisstyrning och skiljer sig bara i var priserna hämtas.",
+      "EN": "<p><b>Settings</b></p><br>Select, which control mechanism should be used. With NibePi control, select the data source. For integration with Tibber, please use your personal access token, which can be obtained from  https://developer.tibber.com/. Elprisetjustnu.se needs no token, only your price area — both sources use the same local price control and differ only in where the prices come from.",
+      "DE": "<p><b>Einstellungen</b></p><br>Wähle aus, welcher Regelmechanismus verwendet werden soll. Für NibePi Regeleung, bitte die Datenquelle wählen. Für die Verwendung von Tibber muss ein persönliches Acces-Token verwendet werden. Dieses kist hier erhältlich: https://developer.tibber.com/. Elprisetjustnu.se benötigt kein Token, nur die Strompreiszone — beide Quellen verwenden dieselbe lokale Preissteuerung und unterscheiden sich nur darin, woher die Preise kommen."
     },
     "price_enable_hw": {
       "SE": "<b>Aktivera varmvattenreglering</b>",
