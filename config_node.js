@@ -61,6 +61,9 @@ module.exports = function(RED) {
     let vvEventTrough = null;   // lägsta BT6 i pågående event
     let vvEventTroughTs = null; // när bottennoteringen sattes
     let vvEventPeakTs = null;   // när BT6 senast stod på toppen
+    let vvEventHourDeg = null;  // timme (0-167) -> grader tappade, för bokföringen
+    let vvChargeActive = false; // pumpen laddar varmvatten just nu
+    let vvChargeSettleUntil = 0;// BT6 får lugna sig så länge efter en laddning
 
     // Hur långt BT6 ska falla under toppen för att räknas som ett påbörjat tapp.
     // 0.3 °C räckte för att varje steg i stilleståndsförlusten skulle öppna
@@ -79,13 +82,21 @@ module.exports = function(RED) {
     // BT6 har stigit så här mycket över botten => återvärmning igång, avsluta.
     const VV_DRAW_RECOVER_DELTA = 0.5;            // °C
     // Stillestånds- och cirkulationsförlust skiljs från tappning på hastighet,
-    // inte på längd: avsvalning ligger kring 0.5 °C/h medan även ett utdraget
-    // kvällstapp ligger över 3 °C/h. Under den här gränsen lärs ingenting in.
-    const VV_DRAW_MIN_RATE = 1.5;                 // °C/h
-    // Hur länge ett event får krypa under VV_DRAW_MIN_RATE innan dess origo
+    // inte på längd. Uppmätt på sex dygn: tankens egen förlust under de lugnaste
+    // timmarna (03-06, 731 fönster) har medianen 0.50 °C/h, 90:e percentilen
+    // 0.70 och maximum 1.20. Diskmaskinens program, som HA kunde tidsstämpla,
+    // ligger på 1.65-2.1 °C/h. Tröskeln ligger i glappet.
+    const VV_DRAW_MIN_RATE = 1.2;                 // °C/h
+    // Egen, lägre tröskel för rebasen. Med samma värde som VV_DRAW_MIN_RATE åt
+    // rebasen upp långsamma men verkliga kvällstapp innan de hann stängas.
+    const VV_DRAW_REBASE_RATE = 0.9;              // °C/h
+    // Hur länge ett event får krypa under VV_DRAW_REBASE_RATE innan dess origo
     // flyttas fram till nuläget i stället för att avsvalningen krediteras ett
     // senare tapp.
     const VV_DRAW_REBASE_MS = 30 * 60 * 1000;
+    // Efter en laddning står BT6 kvar på laddkretsens temperatur en stund.
+    // Detektionen börjar om först när den hunnit jämna ut sig.
+    const VV_CHARGE_SETTLE_MS = 10 * 60 * 1000;
     // Ren säkerhetsbroms så att ett event inte kan leva hur länge som helst.
     // Gränsen var 90 min och gjorde dubbelt arbete: den användes också för att
     // förkasta stillestånd, och förkastade därmed verkliga kvällstapp som tagit
@@ -486,6 +497,68 @@ function vvAiMarkSeenToday(store, hw, idx, ts) {
         saveVvAiStore(true);
     }
 
+
+    // Väljer den timme under eventet då FLEST grader faktiskt drogs, och
+    // returnerar en tidsstämpel i den. Tappet bokfördes tidigare på timmen då
+    // botten nåddes, men när ett event spänner över en hel tappomgång ligger
+    // botten typiskt en timme efter förbrukningen - och planeraren värmer FÖRE
+    // peaktimmen, så en timme för sent är värre än ett för litet värde. Mot sex
+    // dygns HA-data återger den här regeln timmarna 19, 21, 69, 104 och 108 som
+    // den gamla koden hittade, medan bottentimmen sköt dem till 20, 22 och 32.
+    function vvSteepestHourTs(fallbackTs) {
+        if (!vvEventHourDeg) {
+            return fallbackTs;
+        }
+        let bestTs = null;
+        let bestDeg = -1;
+        for (const key of Object.keys(vvEventHourDeg)) {
+            const slot = vvEventHourDeg[key];
+            if (slot && slot.deg > bestDeg) {
+                bestDeg = slot.deg;
+                bestTs = slot.ts;
+            }
+        }
+        return (bestTs === null) ? fallbackTs : bestTs;
+    }
+
+    // Stänger och utvärderar ett pågående tapp-event. Bröts ut ur vvAiTick när
+    // laddningsspärren behövde kunna stänga ett event mitt i: logiken får inte
+    // finnas i två exemplar som kan glida isär.
+    function vvCloseDrawEvent(cfgHotwater, minDrop, current, ts, why) {
+        const span = vvEventPeak - vvEventTrough;
+        const fallMs = ts - (vvEventPeakTs || vvEventStartTs || ts);
+        const rate = fallMs > 0 ? (span / (fallMs / 3600000)) : Infinity;
+        const tooSlow = rate < VV_DRAW_MIN_RATE;
+        const drop = tooSlow ? 0 : span;
+        const durMin = Math.round((ts - (vvEventStartTs || ts)) / 60000);
+        const bt6Span = `BT6 ${vvEventPeak.toFixed(1)} → ${vvEventTrough.toFixed(1)} °C`;
+
+        if (Number.isFinite(drop) && drop >= minDrop) {
+            const learnTs = vvSteepestHourTs(vvEventTroughTs || ts);
+            registerVvDraw(cfgHotwater, drop, learnTs);
+            nibe.log(`VV-tapp registrerat: ${drop.toFixed(1)} °C (${bt6Span}), ` +
+                `${durMin} min, ${rate.toFixed(1)} °C/h, ` +
+                `timme ${getWeekHourIndex(learnTs)}/167, avslut: ${why}`,
+                'hotwater', 'debug');
+        } else if (tooSlow) {
+            nibe.log(`VV-tapp förkastat (stillestånds-/cirkulationsförlust): ` +
+                `${span.toFixed(1)} °C (${bt6Span}) på ${durMin} min ` +
+                `= ${rate.toFixed(1)} °C/h < ${VV_DRAW_MIN_RATE} °C/h`,
+                'hotwater', 'debug');
+        } else {
+            nibe.log(`VV-tapp förkastat: ${span.toFixed(1)} °C < tröskel ${minDrop} °C ` +
+                `(${bt6Span}), ${durMin} min, avslut: ${why}`,
+                'hotwater', 'debug');
+        }
+
+        vvInEvent = false;
+        vvEventStartTs = null;
+        vvEventTrough = null;
+        vvEventTroughTs = null;
+        vvEventHourDeg = null;
+        vvEventPeak = current;
+        vvEventPeakTs = ts;
+    }
 
     // Nattspärr för VV-plan: AI-planerad värmning får aldrig ligga mellan 00:00 och 03:00.
     // (Min-temp-failsafe kan fortfarande trigga om du har den på.)
@@ -1326,22 +1399,74 @@ async function vvAiTick() {
             const current = Number(bt6.data);
             const minDrop = getVvMinDrop(hw);
 
-            // Tappet mäts topp-till-botten i stället för som en summa av per-tick-deltan.
-            // Den gamla summan nollställdes av *varje* sample där BT6 inte sjönk – en platt
-            // minut, sensorbrus eller två tickar som läste samma värde räckte. Ett verkligt
-            // tapp på flera grader styckades då upp i bitar under minDrop och kastades. Nu
-            // avläses (topp - botten) över hela eventet, precis som när man läser av en
-            // BT6-graf för hand, vilket tål platta och lätt stigande samples.
-            if (vvLastBt6 === null || vvEventPeak === null) {
+            // Laddar pumpen varmvatten just nu? BT6 sitter på LADDKRETSEN, inte i
+            // tanken: när laddpumpen startar passerar vatten från tankens botten
+            // givaren, så BT6 störtdyker och klättrar sedan tillbaka till exakt
+            // samma värde. 18 sep gav det ett "tapp" på 24 °C på 12 minuter som
+            // återhämtades till 99 % inom timmen - medan BT7 i tanktoppen STEG,
+            // eftersom tanken värmdes. Det är brantare och renare än något
+            // verkligt tapp och blev det största värdet i hela profilen. Utan den
+            // här spärren lär sig profilen pumpens laddningar i stället för
+            // hushållets förbrukning.
+            let prioRaw;
+            try {
+                const prio = await getNibeData(hP['prio']).catch(() => undefined);
+                prioRaw = (prio && prio.data !== undefined) ? prio.data : undefined;
+            } catch (e) {
+                prioRaw = undefined;
+            }
+            // 43086 Prio: 10 av, 20 varmvatten, 30 värme, 40/41 pool, 50 transfer,
+            // 60 kyla. Går värdet inte att tolka behandlas det som "laddar inte",
+            // så att ett saknat register inte tystar inlärningen helt.
+            const prioNum = Number(prioRaw);
+            const vvCharging = Number.isFinite(prioNum)
+                ? (prioNum === 20)
+                : (typeof prioRaw === 'string' && /varmvatten|hot\s*water/i.test(prioRaw));
+
+            if (vvCharging || vvChargeSettleUntil > ts) {
+                if (vvCharging && !vvChargeActive) {
+                    vvChargeActive = true;
+                    // Ett tapp som pågår när laddningen startar ska UTVÄRDERAS,
+                    // inte kastas. Fallet före laddningen är den verkliga
+                    // förbrukningen, och det är den som utlöste laddningen -
+                    // pumpen startar ju på att BT6 gått under sin starttemperatur.
+                    // Kastas eventet i stället försvinner nästan varje tapp: över
+                    // sex dygn behölls 1 av 17 när de kastades, 13 när de
+                    // utvärderades.
+                    if (vvInEvent) {
+                        vvCloseDrawEvent(hw, minDrop, current, ts, 'laddning startade');
+                    }
+                }
+                if (vvCharging) {
+                    vvChargeSettleUntil = ts + VV_CHARGE_SETTLE_MS;
+                }
+                // Under laddningen, och en stund efter, mäter BT6 laddkretsen och
+                // inte tanken. Nolla allt så att detektionen börjar om på ett
+                // färskt värde när den lugnat sig.
+                vvInEvent = false;
+                vvEventStartTs = null;
+                vvEventTrough = null;
+                vvEventTroughTs = null;
+                vvEventHourDeg = null;
+                vvEventPeak = null;
+                vvEventPeakTs = null;
+                vvLastBt6 = null;
+            } else if (vvLastBt6 === null || vvEventPeak === null) {
+                vvChargeActive = false;
                 vvLastBt6 = current;
                 vvEventPeak = current;
                 vvEventPeakTs = ts;
                 vvEventTrough = null;
                 vvEventTroughTs = null;
                 vvEventStartTs = null;
+                vvEventHourDeg = null;
                 vvInEvent = false;
             } else if (!vvInEvent) {
-                // Utanför event: toppen följer BT6 uppåt (tanken laddas).
+                vvChargeActive = false;
+                // Utanför event: toppen följer BT6 uppåt (tanken laddas). >= och
+                // inte >, så att vvEventPeakTs följer med när tanken står stilla
+                // på toppvärdet - annars räknas en lång stiltje in i
+                // fallhastigheten för tappet som kommer efteråt.
                 if (current >= vvEventPeak) {
                     vvEventPeak = current;
                     vvEventPeakTs = ts;
@@ -1352,16 +1477,29 @@ async function vvAiTick() {
                     vvEventStartTs = ts;
                     vvEventTrough = current;
                     vvEventTroughTs = ts;
+                    vvEventHourDeg = {};
                     nibe.log(`VV-tapp påbörjat: BT6 ${current.toFixed(1)} °C, ` +
                         `${(vvEventPeak - current).toFixed(1)} °C under topp ${vvEventPeak.toFixed(1)} °C`,
                         'hotwater', 'debug');
                 }
                 vvLastBt6 = current;
             } else {
+                vvChargeActive = false;
                 // I event: följ botten. Varje ny bottennotering håller eventet levande.
                 if (vvEventTrough === null || current < vvEventTrough) {
                     vvEventTrough = current;
                     vvEventTroughTs = ts;
+                }
+
+                // Grader per timme, till bokföringen. Se vvSteepestHourTs.
+                if (Number.isFinite(vvLastBt6) && current < vvLastBt6) {
+                    const hIdx = getWeekHourIndex(ts);
+                    if (!vvEventHourDeg) {
+                        vvEventHourDeg = {};
+                    }
+                    const slot = vvEventHourDeg[hIdx] || { deg: 0, ts: ts };
+                    slot.deg += (vvLastBt6 - current);
+                    vvEventHourDeg[hIdx] = slot;
                 }
 
                 // Fallhastigheten mäts från när BT6 senast stod på toppen, inte
@@ -1378,24 +1516,18 @@ async function vvAiTick() {
 
                 if (!recovered &&
                     (ts - (vvEventStartTs || ts)) >= VV_DRAW_REBASE_MS &&
-                    rate < VV_DRAW_MIN_RATE) {
-                    // Eventet har krupit i en halvtimme: det är avsvalning, inte en
-                    // tappning. Flytta fram origo i stället för att stänga, annars
-                    // krediteras avsvalningen ett senare tapp - fyra timmars
-                    // stillestånd följt av en 5 °C-dusch bokfördes som 7 °C.
+                    rate < VV_DRAW_REBASE_RATE) {
+                    // Eventet har krupit i en halvtimme: avsvalning, inte tappning.
+                    // Flytta fram origo i stället för att stänga, annars krediteras
+                    // avsvalningen ett senare tapp - fyra timmars stillestånd följt
+                    // av en 5 °C-dusch bokfördes som 7 °C.
                     vvEventStartTs = ts;
                     vvEventPeak = current;
                     vvEventPeakTs = ts;
                     vvEventTrough = current;
                     vvEventTroughTs = ts;
+                    vvEventHourDeg = {};
                 } else if (recovered || sinceNewLow >= VV_DRAW_IDLE_CLOSE_MS || tooLong) {
-                    const span = vvEventPeak - vvEventTrough;
-                    const tooSlow = rate < VV_DRAW_MIN_RATE;
-                    const drop = tooSlow ? 0 : span;
-
-                    // Loggas alltid när ett event stängs, så att man kan skilja
-                    // "inget event alls" från "event som föll under tröskeln".
-                    const durMin = Math.round((ts - (vvEventStartTs || ts)) / 60000);
                     const idleMin = Math.round(VV_DRAW_IDLE_CLOSE_MS / 60000);
                     const maxMin = Math.round(VV_DRAW_MAX_MS / 60000);
                     const why = recovered
@@ -1403,34 +1535,7 @@ async function vvAiTick() {
                         : (sinceNewLow >= VV_DRAW_IDLE_CLOSE_MS
                             ? `ingen ny botten på ${idleMin} min`
                             : `tidsgräns ${maxMin} min`);
-                    const bt6Span = `BT6 ${vvEventPeak.toFixed(1)} → ${vvEventTrough.toFixed(1)} °C`;
-
-                    if (Number.isFinite(drop) && drop >= minDrop) {
-                        // Bokför tappet på den timme då botten nåddes, inte när vi
-                        // råkade upptäcka att det tagit slut.
-                        const learnTs = vvEventTroughTs || ts;
-                        registerVvDraw(hw, drop, learnTs);
-                        nibe.log(`VV-tapp registrerat: ${drop.toFixed(1)} °C (${bt6Span}), ` +
-                            `${durMin} min, ${rate.toFixed(1)} °C/h, ` +
-                            `timme ${getWeekHourIndex(learnTs)}/167, avslut: ${why}`,
-                            'hotwater', 'debug');
-                    } else if (tooSlow) {
-                        nibe.log(`VV-tapp förkastat (stillestånds-/cirkulationsförlust): ` +
-                            `${span.toFixed(1)} °C (${bt6Span}) på ${durMin} min ` +
-                            `= ${rate.toFixed(1)} °C/h < ${VV_DRAW_MIN_RATE} °C/h`,
-                            'hotwater', 'debug');
-                    } else {
-                        nibe.log(`VV-tapp förkastat: ${span.toFixed(1)} °C < tröskel ${minDrop} °C ` +
-                            `(${bt6Span}), ${durMin} min, avslut: ${why}`,
-                            'hotwater', 'debug');
-                    }
-
-                    vvInEvent = false;
-                    vvEventStartTs = null;
-                    vvEventTrough = null;
-                    vvEventTroughTs = null;
-                    vvEventPeak = current;
-                    vvEventPeakTs = ts;
+                    vvCloseDrawEvent(hw, minDrop, current, ts, why);
                 }
                 vvLastBt6 = current;
             }
