@@ -3737,19 +3737,28 @@ function optimizeElectricityTrading(priceData, options = {}) {
 // runPrice, nu med 15-min stöd och dynamisk hantering av sommar-/vintertid
 async function runPrice(data,array) {
 
-    nibe.log(`Startar elprisreglering runPrice()`,'price','debug');
     let config = nibe.getConfig();
+    // De här raderna loggades innan funktionen kollade om elprisregleringen
+    // överhuvudtaget var påslagen. Själva uppslaget nedan måste ligga kvar där det
+    // ligger - det sätter data.priceSensor som andra delar läser även när
+    // regleringen är av - så det är bara loggningen som flyttar.
+    const priceEnabled = (config.price!==undefined && config.price.enable===true);
     let inside;
-    nibe.log(`Letar efter givare ${config.price['sensor_'+data.system]}`,'price','debug');
+    if(priceEnabled) {
+        nibe.log(`Startar elprisreglering runPrice()`,'price','debug');
+        nibe.log(`Letar efter givare ${config.price['sensor_'+data.system]}`,'price','debug');
+    }
     if(config.price['sensor_'+data.system]!==undefined && config.price['sensor_'+data.system]!=="") {
         let index = array.findIndex(i => i.name == config.price['sensor_'+data.system]);
         if(index!==-1) {
             inside = array[index];
-            nibe.log(`Sätter inomhusgivare ${config.price['sensor_'+data.system]}, ${inside.data} grader`,'price','debug');
+            if(priceEnabled) {
+                nibe.log(`Sätter inomhusgivare ${config.price['sensor_'+data.system]}, ${inside.data} grader`,'price','debug');
+            }
         }
     }
     data.priceSensor = inside;
-    if(config.price!==undefined && config.price.enable===true) {
+    if(priceEnabled) {
         nibe.log(`Elprisreglering är aktiverad`,'price','debug');
         if(config.price.source=="tibber") {
             nibe.log(`Källan är Lokal AI via Tibber`,'price','debug');
@@ -4787,7 +4796,6 @@ async function runFan() {
         return;
     }
     isRunFanExecuting = true;
-    nibe.log('Kör runFan()', 'fan', 'debug');
 
     try {
         let config = nibe.getConfig();
@@ -4797,6 +4805,9 @@ async function runFan() {
         if(config.fan.enable!==true) {
             return;
         }
+        // Loggades före den här kontrollen, så ett avstängt luftflöde skrev en rad
+        // i minuten - 1440 per dygn - om att köra något det inte gjorde.
+        nibe.log('Kör runFan()', 'fan', 'debug');
 
         // Steg 1: Hämta grundläggande data (återgår till steg-för-steg-metoden)
         data.cpr_set = await getNibeData(hP['cpr_set']).catch(console.log);
