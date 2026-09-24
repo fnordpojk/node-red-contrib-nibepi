@@ -3541,66 +3541,6 @@ let value = Number((__own ? (baseKr * (__applyVat ? (1 + vatRate) : 1) + (additi
         let result = {values:sendArray,system:system};
         return result;
     }
-    function tibberBuildGraph(tibber,system) {
-        let config = nibe.getConfig();
-        if(config.price===undefined) {
-            config.price = {};
-            nibe.setConfig(config);
-        }
-        if(config.price.tibber_home===undefined) {
-            config.price.tibber_home = 0
-            nibe.setConfig(config);
-        }
-        let heat_enable = config.price['enable_heat_'+system];
-        var today = tibber.data.viewer.homes[config.price.tibber_home].currentSubscription.priceInfo.today;
-        var tomorrow;
-        if(tibber.data.viewer.homes[config.price.tibber_home].currentSubscription.priceInfo.tomorrow!==undefined) {
-            tomorrow = tibber.data.viewer.homes[config.price.tibber_home].currentSubscription.priceInfo.tomorrow;
-        }
-        var priceArray = today.concat(tomorrow);
-        priceArray.sort(function(a,b){return a.energy - b.energy});
-        if(tibber.data.viewer.homes[config.price.tibber_home].currentSubscription.priceInfo.tomorrow!==undefined) {
-            tomorrow = tibber.data.viewer.homes[config.price.tibber_home].currentSubscription.priceInfo.tomorrow;
-        }
-        var valueArray = [];
-        var adjustArray = [];
-        for( var o = 0; o < priceArray.length; o++){
-            let timestamp = toTimestamp(priceArray[o].startsAt)
-            var adjust = 0;
-            let hotwater_adjust = Number(config.price.hotwater_normal);
-            let value = Number(priceArray[o].energy.toFixed(2));
-            if(priceArray[o].level=="VERY_CHEAP") {
-                hotwater_adjust = Number(config.price.hotwater_very_cheap);
-                if(heat_enable!==undefined && heat_enable===true) adjust = config.price['heat_very_cheap_'+system]||0;
-            } else if(priceArray[o].level=="CHEAP") {
-                hotwater_adjust = Number(config.price.hotwater_cheap);
-                if(heat_enable!==undefined && heat_enable===true) adjust = config.price['heat_cheap_'+system]||0;
-            } else if(priceArray[o].level=="NORMAL") {
-                hotwater_adjust = Number(config.price.hotwater_normal);
-                if(heat_enable!==undefined && heat_enable===true) adjust = config.price['heat_normal_'+system]||0;
-            } else if(priceArray[o].level=="EXPENSIVE") {
-                hotwater_adjust = Number(config.price.hotwater_expensive);
-                if(heat_enable!==undefined && heat_enable===true) adjust = config.price['heat_expensive_'+system]||0;
-            } else if(priceArray[o].level=="VERY_EXPENSIVE") {
-                hotwater_adjust = Number(config.price.hotwater_very_expensive);
-                if(heat_enable!==undefined && heat_enable===true) adjust = config.price['heat_very_expensive_'+system]||0;
-            }
-            valueArray.push({x:timestamp,y:Number(value)});
-            adjustArray.push({x:timestamp,y:Number(adjust.toFixed(2))})
-
-        }
-        valueArray.sort((a, b) => (a.x > b.x) ? 1 : -1)
-        adjustArray.sort((a, b) => (a.x > b.x) ? 1 : -1)
-
-        var sendArray = [
-            {
-                "series":["Pris","Kurvjustering"],
-                "data":[valueArray,adjustArray],
-                "labels":["Pris","Kurvjustering"]
-            }];
-        let result = {values:sendArray,system:system};
-        return result;
-    }
 
 ///////##########################################################
 // ##################################################################
