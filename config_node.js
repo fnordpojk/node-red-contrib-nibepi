@@ -3661,6 +3661,43 @@ function formatResult(optimalTrades) {
     };
 }
 
+// Härleder prisnivåer ur en optimering. Bröts ut när varmvattnet fick tillbaka
+// sin egen tidshorisont: värme och varmvatten kör samma logik på två olika
+// fönster, och den fick inte finnas i fyra exemplar.
+function priceLevelsFromTrades(trades, currentHourDate, fullPriceList) {
+    let level = 'NORMAL';
+    let veryCheapHours, cheapHours, expensiveHours, veryExpensiveHours;
+
+    if (trades.buy.length > 0) {
+        const buyPrices = trades.buy.sort((a, b) => a.value - b.value);
+        const sellPrices = trades.sell.sort((a, b) => a.value - b.value);
+        const buyMedianIndex = Math.floor(buyPrices.length / 2);
+        const sellMedianIndex = Math.floor(sellPrices.length / 2);
+
+        veryCheapHours = new Set(buyPrices.slice(0, buyMedianIndex).map(p => p.date));
+        cheapHours = new Set(buyPrices.slice(buyMedianIndex).map(p => p.date));
+        expensiveHours = new Set(sellPrices.slice(0, sellMedianIndex).map(p => p.date));
+        veryExpensiveHours = new Set(sellPrices.slice(sellMedianIndex).map(p => p.date));
+
+        if (veryCheapHours.has(currentHourDate)) level = 'VERY_CHEAP';
+        else if (cheapHours.has(currentHourDate)) level = 'CHEAP';
+        else if (veryExpensiveHours.has(currentHourDate)) level = 'VERY_EXPENSIVE';
+        else if (expensiveHours.has(currentHourDate)) level = 'EXPENSIVE';
+    }
+
+    const prices = fullPriceList.map(p => {
+        const date = p.startsAt;
+        let hourLevel = 'NORMAL';
+        if (veryCheapHours && veryCheapHours.has(date)) hourLevel = 'VERY_CHEAP';
+        else if (cheapHours && cheapHours.has(date)) hourLevel = 'CHEAP';
+        else if (veryExpensiveHours && veryExpensiveHours.has(date)) hourLevel = 'VERY_EXPENSIVE';
+        else if (expensiveHours && expensiveHours.has(date)) hourLevel = 'EXPENSIVE';
+        return { value: p.total * 100, level: hourLevel, ts: new Date(p.startsAt).getTime() };
+    });
+
+    return { level, prices };
+}
+
 function optimizeElectricityTrading(priceData, options = {}) {
     if (!Array.isArray(priceData) || priceData.length === 0) {
         return { buy: [], sell: [] };
@@ -3832,42 +3869,39 @@ async function runPrice(data,array) {
                 };
                 const optimalTrades = optimizeElectricityTrading(priceDataForAlgo, algoOptions);
 
-                let currentLevel = 'NORMAL';
-                let veryCheapHours, cheapHours, expensiveHours, veryExpensiveHours;
-
-                if (optimalTrades.buy.length > 0) {
-                    const buyPrices = optimalTrades.buy.sort((a, b) => a.value - b.value);
-                    const sellPrices = optimalTrades.sell.sort((a, b) => a.value - b.value);
-                    const buyMedianIndex = Math.floor(buyPrices.length / 2);
-                    const sellMedianIndex = Math.floor(sellPrices.length / 2);
-
-                    veryCheapHours = new Set(buyPrices.slice(0, buyMedianIndex).map(p => p.date));
-                    cheapHours = new Set(buyPrices.slice(buyMedianIndex).map(p => p.date));
-                    expensiveHours = new Set(sellPrices.slice(0, sellMedianIndex).map(p => p.date));
-                    veryExpensiveHours = new Set(sellPrices.slice(sellMedianIndex).map(p => p.date));
-
-                    if (veryCheapHours.has(currentHourDate)) currentLevel = 'VERY_CHEAP';
-                    else if (cheapHours.has(currentHourDate)) currentLevel = 'CHEAP';
-                    else if (veryExpensiveHours.has(currentHourDate)) currentLevel = 'VERY_EXPENSIVE';
-                    else if (expensiveHours.has(currentHourDate)) currentLevel = 'EXPENSIVE';
-                }
+                const heatLevels = priceLevelsFromTrades(optimalTrades, currentHourDate, fullPriceList);
 
                 const heat = {
-                    level: currentLevel,
+                    level: heatLevels.level,
                     current: currentHour.total * 100,
-                    prices: fullPriceList.map(p => {
-                        const date = p.startsAt;
-                        let hourLevel = 'NORMAL';
-                        if (veryCheapHours && veryCheapHours.has(date)) hourLevel = 'VERY_CHEAP';
-                        else if (cheapHours && cheapHours.has(date)) hourLevel = 'CHEAP';
-                        else if (veryExpensiveHours && veryExpensiveHours.has(date)) hourLevel = 'VERY_EXPENSIVE';
-                        else if (expensiveHours && expensiveHours.has(date)) hourLevel = 'EXPENSIVE';
-
-                        return { value: p.total * 100, level: hourLevel, ts: new Date(p.startsAt).getTime() };
-                    })
+                    prices: heatLevels.prices
                 };
 
-                const hw = { ...heat };
+                // Varmvattnet har en egen tidshorisont. Inställningen har funnits
+                // hela tiden men lästes bara av moln-AI:n, så sedan den försvann
+                // har reglaget inte gjort någonting alls - hw var en ren kopia av
+                // heat. Nu körs optimeringen en gång till med time_hw när den
+                // skiljer sig från värmens fönster. Kortare fönster för varmvatten
+                // är det vanliga: tanken räcker några timmar, huset längre.
+                const heatWindow = Number(config.price.time);
+                const hwWindow = Number(config.price.time_hw);
+                let hw;
+                if (Number.isFinite(hwWindow) && hwWindow > 0 && hwWindow !== heatWindow) {
+                    const hwTrades = optimizeElectricityTrading(priceDataForAlgo, {
+                        timeWindow: hwWindow,
+                        minSpread: config.price.min_spread
+                    });
+                    const hwLevels = priceLevelsFromTrades(hwTrades, currentHourDate, fullPriceList);
+                    hw = {
+                        level: hwLevels.level,
+                        current: heat.current,
+                        prices: hwLevels.prices
+                    };
+                    nibe.log(`Varmvatten på egen tidshorisont ${hwWindow} h (värme ${heatWindow} h): ` +
+                        `nivå ${hw.level}, värme ${heat.level}`, 'price', 'debug');
+                } else {
+                    hw = { ...heat };
+                }
                 data.priceai = { heat, hw };
                 data.price_current = {
   data: (function(){
@@ -4088,41 +4122,39 @@ try {
                 };
                 const optimalTrades = optimizeElectricityTrading(priceDataForAlgo, algoOptions);
 
-                let currentLevel = 'NORMAL';
-                let veryCheapHours, cheapHours, expensiveHours, veryExpensiveHours;
-
-                if (optimalTrades.buy.length > 0) {
-                    const buyPrices = optimalTrades.buy.sort((a, b) => a.value - b.value);
-                    const sellPrices = optimalTrades.sell.sort((a, b) => a.value - b.value);
-                    const buyMedianIndex = Math.floor(buyPrices.length / 2);
-                    const sellMedianIndex = Math.floor(sellPrices.length / 2);
-
-                    veryCheapHours = new Set(buyPrices.slice(0, buyMedianIndex).map(p => p.date));
-                    cheapHours = new Set(buyPrices.slice(buyMedianIndex).map(p => p.date));
-                    expensiveHours = new Set(sellPrices.slice(0, sellMedianIndex).map(p => p.date));
-                    veryExpensiveHours = new Set(sellPrices.slice(sellMedianIndex).map(p => p.date));
-
-                    if (veryCheapHours.has(currentHourDate)) currentLevel = 'VERY_CHEAP';
-                    else if (cheapHours.has(currentHourDate)) currentLevel = 'CHEAP';
-                    else if (veryExpensiveHours.has(currentHourDate)) currentLevel = 'VERY_EXPENSIVE';
-                    else if (expensiveHours.has(currentHourDate)) currentLevel = 'EXPENSIVE';
-                }
+                const heatLevels = priceLevelsFromTrades(optimalTrades, currentHourDate, fullPriceList);
 
                 const heat = {
-                    level: currentLevel,
+                    level: heatLevels.level,
                     current: currentHour.total * 100,
-                    prices: fullPriceList.map(p => {
-                        const date = p.startsAt;
-                        let hourLevel = 'NORMAL';
-                        if (veryCheapHours && veryCheapHours.has(date)) hourLevel = 'VERY_CHEAP';
-                        else if (cheapHours && cheapHours.has(date)) hourLevel = 'CHEAP';
-                        else if (veryExpensiveHours && veryExpensiveHours.has(date)) hourLevel = 'VERY_EXPENSIVE';
-                        else if (expensiveHours && expensiveHours.has(date)) hourLevel = 'EXPENSIVE';
-                        return { value: p.total * 100, level: hourLevel, ts: new Date(p.startsAt).getTime() };
-                    })
+                    prices: heatLevels.prices
                 };
 
-                const hw = { ...heat };
+                // Varmvattnet har en egen tidshorisont. Inställningen har funnits
+                // hela tiden men lästes bara av moln-AI:n, så sedan den försvann
+                // har reglaget inte gjort någonting alls - hw var en ren kopia av
+                // heat. Nu körs optimeringen en gång till med time_hw när den
+                // skiljer sig från värmens fönster. Kortare fönster för varmvatten
+                // är det vanliga: tanken räcker några timmar, huset längre.
+                const heatWindow = Number(config.price.time);
+                const hwWindow = Number(config.price.time_hw);
+                let hw;
+                if (Number.isFinite(hwWindow) && hwWindow > 0 && hwWindow !== heatWindow) {
+                    const hwTrades = optimizeElectricityTrading(priceDataForAlgo, {
+                        timeWindow: hwWindow,
+                        minSpread: config.price.min_spread
+                    });
+                    const hwLevels = priceLevelsFromTrades(hwTrades, currentHourDate, fullPriceList);
+                    hw = {
+                        level: hwLevels.level,
+                        current: heat.current,
+                        prices: hwLevels.prices
+                    };
+                    nibe.log(`Varmvatten på egen tidshorisont ${hwWindow} h (värme ${heatWindow} h): ` +
+                        `nivå ${hw.level}, värme ${heat.level}`, 'price', 'debug');
+                } else {
+                    hw = { ...heat };
+                }
                 data.priceai = { heat, hw };
                 data.price_current = {
   data: (function(){
