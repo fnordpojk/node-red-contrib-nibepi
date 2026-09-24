@@ -5468,7 +5468,6 @@ async function checkEfficiency(runtime,defrost) {
     saveDataGraph('cpr_downtime',time,downtime,true);
 }
 async function runDiagnostic() {
-    nibe.log(`Running diagnostic`,'diagnostic','debug');
     async function uptimeCheck() {
         getNibeData(hP['cpr_act']).then(cpr => {
             if(cpr.data>=1) {
@@ -5543,12 +5542,11 @@ async function runDiagnostic() {
         nibe.setConfig(config);
     }
     if(config.system.pump!==undefined && (config.system.pump=="F730" || config.system.pump=="F750")) {
+        nibe.log(`Running diagnostic`,'diagnostic','debug');
         nibe.log(`Heatpump is supported, starting defrost check timer, timer: ${defrostTimer/1000} sec`,'diagnostic','debug');
         if(timer.diagnostic===undefined || timer.diagnostic._idleTimeout===-1) {
             timer.diagnostic = setTimeout(defrostCheck, defrostTimer);
         }
-    } else {
-        nibe.log(`Heatpump is not supported`,'diagnostic','debug');
     }
 }
 async function tenMinuteUpdate() {
