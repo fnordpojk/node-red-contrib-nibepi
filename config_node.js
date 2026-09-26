@@ -64,6 +64,7 @@ module.exports = function(RED) {
     let vvEventHourDeg = null;  // timme (0-167) -> grader tappade, för bokföringen
     let vvChargeActive = false; // pumpen laddar varmvatten just nu
     let vvChargeSettleUntil = 0;// BT6 får lugna sig så länge efter en laddning
+    let vvEventHistory = [];    // BT6 under pågående event, för VV_DRAW_TRAIL_MS
 
     // Hur långt BT6 ska falla under toppen för att räknas som ett påbörjat tapp.
     // 0.3 °C räckte för att varje steg i stilleståndsförlusten skulle öppna
@@ -97,6 +98,12 @@ module.exports = function(RED) {
     // Efter en laddning står BT6 kvar på laddkretsens temperatur en stund.
     // Detektionen börjar om först när den hunnit jämna ut sig.
     const VV_CHARGE_SETTLE_MS = 10 * 60 * 1000;
+    // Har BT6 under så här lång tid bara fallit i avsvalningstakt är tappet slut
+    // och eventet stängs. Annars samlar ett event som öppnats av ett verkligt tapp
+    // på sig avsvalning tills något annat stoppar det, och bedöms på ett snitt
+    // där tappet späds ut - eller där avsvalningen fyller ut ett litet tapp till
+    // över minDrop. Längre än mellanrummen mellan en diskmaskins fyllningar.
+    const VV_DRAW_TRAIL_MS = 60 * 60 * 1000;
     // Ren säkerhetsbroms så att ett event inte kan leva hur länge som helst.
     // Gränsen var 90 min och gjorde dubbelt arbete: den användes också för att
     // förkasta stillestånd, och förkastade därmed verkliga kvällstapp som tagit
@@ -548,13 +555,13 @@ function vvAiMarkSeenToday(store, hw, idx, ts) {
             const learnTs = vvSteepestHourTs(vvEventTroughTs || ts);
             registerVvDraw(cfgHotwater, drop, learnTs);
             nibe.log(`VV-tapp registrerat: ${drop.toFixed(1)} °C (${bt6Span}), ` +
-                `${durMin} min, ${rate.toFixed(1)} °C/h, ` +
+                `${durMin} min, ${rate.toFixed(2)} °C/h, ` +
                 `timme ${getWeekHourIndex(learnTs)}/167, avslut: ${why}`,
                 'hotwater', 'debug');
         } else if (tooSlow) {
             nibe.log(`VV-tapp förkastat (stillestånds-/cirkulationsförlust): ` +
                 `${span.toFixed(1)} °C (${bt6Span}) på ${durMin} min ` +
-                `= ${rate.toFixed(1)} °C/h < ${VV_DRAW_MIN_RATE} °C/h`,
+                `= ${rate.toFixed(2)} °C/h < ${VV_DRAW_MIN_RATE.toFixed(2)} °C/h`,
                 'hotwater', 'debug');
         } else {
             nibe.log(`VV-tapp förkastat: ${span.toFixed(1)} °C < tröskel ${minDrop} °C ` +
@@ -567,6 +574,7 @@ function vvAiMarkSeenToday(store, hw, idx, ts) {
         vvEventTrough = null;
         vvEventTroughTs = null;
         vvEventHourDeg = null;
+        vvEventHistory = [];
         vvEventPeak = current;
         vvEventPeakTs = ts;
     }
@@ -1497,6 +1505,7 @@ async function vvAiTick() {
                     vvEventTrough = current;
                     vvEventTroughTs = ts;
                     vvEventHourDeg = {};
+                    vvEventHistory = [{ ts: ts, v: current }];
                     nibe.log(`VV-tapp påbörjat: BT6 ${current.toFixed(1)} °C, ` +
                         `${(vvEventPeak - current).toFixed(1)} °C under topp ${vvEventPeak.toFixed(1)} °C`,
                         'hotwater', 'debug');
@@ -1533,6 +1542,18 @@ async function vvAiTick() {
                 const recovered = (current - vvEventTrough) >= VV_DRAW_RECOVER_DELTA;
                 const tooLong = (ts - (vvEventStartTs || ts)) >= VV_DRAW_MAX_MS;
 
+                vvEventHistory.push({ ts: ts, v: current });
+                while (vvEventHistory.length > 1 && vvEventHistory[1].ts <= ts - VV_DRAW_TRAIL_MS) {
+                    vvEventHistory.shift();
+                }
+                let drawOver = false;
+                const oldest = vvEventHistory[0];
+                if ((ts - (vvEventStartTs || ts)) >= VV_DRAW_TRAIL_MS && oldest &&
+                    oldest.ts <= ts - VV_DRAW_TRAIL_MS) {
+                    const trailRate = (oldest.v - current) / ((ts - oldest.ts) / 3600000);
+                    drawOver = trailRate < VV_DRAW_REBASE_RATE;
+                }
+
                 if (!recovered &&
                     (ts - (vvEventStartTs || ts)) >= VV_DRAW_REBASE_MS &&
                     rate < VV_DRAW_REBASE_RATE) {
@@ -1546,14 +1567,17 @@ async function vvAiTick() {
                     vvEventTrough = current;
                     vvEventTroughTs = ts;
                     vvEventHourDeg = {};
-                } else if (recovered || sinceNewLow >= VV_DRAW_IDLE_CLOSE_MS || tooLong) {
+                    vvEventHistory = [{ ts: ts, v: current }];
+                } else if (recovered || sinceNewLow >= VV_DRAW_IDLE_CLOSE_MS || tooLong || drawOver) {
                     const idleMin = Math.round(VV_DRAW_IDLE_CLOSE_MS / 60000);
                     const maxMin = Math.round(VV_DRAW_MAX_MS / 60000);
                     const why = recovered
                         ? 'återhämtning'
                         : (sinceNewLow >= VV_DRAW_IDLE_CLOSE_MS
                             ? `ingen ny botten på ${idleMin} min`
-                            : `tidsgräns ${maxMin} min`);
+                            : (drawOver
+                                ? 'tappet är över'
+                                : `tidsgräns ${maxMin} min`));
                     vvCloseDrawEvent(hw, minDrop, current, ts, why);
                 }
                 vvLastBt6 = current;
