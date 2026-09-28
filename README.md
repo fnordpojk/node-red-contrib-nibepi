@@ -76,6 +76,20 @@ nodes that have since been rewritten. Replace both, or neither.
 What does carry over: `config.json` is unchanged, and the VV-AI profile is
 migrated from its old location automatically the first time the node loads.
 
+**Home Assistant entity IDs change.** With MQTT discovery on, 2.0.0 publishes
+the pump as one device, and each sensor now has a unique ID. 1.2.1's sensors had
+none, so Home Assistant cannot carry them over: they are created anew, with IDs
+taken from the device name, e.g. `sensor.nibe_bt1_outdoor_temperature` becomes
+`sensor.nibe_f1245_bt1_outdoor_temperature` (your pump's model in place of
+F1245). History recorded under the old IDs stays with the old IDs. After
+upgrading, update dashboards, automations and template sensors that use them.
+The old per-sensor discovery messages are removed from the broker
+automatically.
+
+The MQTT last will changed with it: NibePi now publishes `online`/`offline`,
+retained, on `<topic prefix>status` (which the Home Assistant entities use for
+availability), instead of `<client id> disconnected` on `nibe`.
+
 Back up before you start:
 
 ```sh
