@@ -22,6 +22,42 @@ module.exports = function(RED) {
         }
         return false;
     };
+    // VV-AI's profile, plan and prices are 168 hour-of-week slots, Monday 00:00 = 0.
+    // A heating window may run across midnight, and from Sunday into Monday.
+    const vvWrap = (i) => ((i % 168) + 168) % 168;
+    // vvAiBuildPlan records each planned window as {start, len, peak, cheapStart}:
+    // the window's first slot and length, the peak it heats for, and the first of the
+    // two consecutive hours in it that are cheapest (null without prices for them).
+    // With price control on, plan heating may happen in those two hours, or in the
+    // last two before the peak once they have passed. The control tick and the chart
+    // both use this, so the hours shown are the hours allowed.
+    const vvAiPlanHeatAllowed = (blocks, hourIndex) => {
+        if (!Array.isArray(blocks) || blocks.length === 0) return true;
+        let allowed = false;
+        for (const b of blocks) {
+            if (vvWrap(hourIndex - b.start) >= b.len) continue;
+            if (b.cheapStart === null) return true;
+            const second = vvWrap(b.cheapStart + 1);
+            if (hourIndex === b.cheapStart || hourIndex === second) {
+                allowed = true;
+                continue;
+            }
+            const untilPeak = vvWrap(b.peak - hourIndex);
+            if ((untilPeak === 1 || untilPeak === 2) && untilPeak < vvWrap(b.peak - second)) {
+                allowed = true;
+            }
+        }
+        return allowed;
+    };
+    const vvAiHeatMask = (blocks) => {
+        const mask = new Array(168).fill(false);
+        for (const b of (Array.isArray(blocks) ? blocks : [])) {
+            if (b.cheapStart === null) continue;
+            mask[b.cheapStart] = true;
+            mask[vvWrap(b.cheapStart + 1)] = true;
+        }
+        return mask;
+    };
     const nibeData = new EventEmitter()
     const nibe = require('nibepi')
     var serialPort = "";
@@ -579,12 +615,6 @@ function vvAiMarkSeenToday(store, hw, idx, ts) {
         vvEventPeakTs = ts;
     }
 
-    // Nattspärr för VV-plan: AI-planerad värmning får aldrig ligga mellan 00:00 och 03:00.
-    // (Min-temp-failsafe kan fortfarande trigga om du har den på.)
-    // Delas av vvAiBuildPlan och vvAiTick.
-    const VV_NIGHT_BLOCK_FROM_H = 0;
-    const VV_NIGHT_BLOCK_TO_H = 3;
-
     async function vvAiBuildPlan(store, hw) {
         try {
             if (!store) return;
@@ -733,6 +763,7 @@ function vvAiMarkSeenToday(store, hw, idx, ts) {
             const rawMinTemp = hw ? Number(hw.vv_ai_min_temp) : NaN;
             const minTemp = Number.isFinite(rawMinTemp) ? rawMinTemp : NaN;
 
+            const heatBlocks = [];
             for (let day = 0; day < 7; day++) {
                 const sum = daySum[day];
 
@@ -772,13 +803,11 @@ if (hw && hw.vv_ai_mode_thresholds_enable) {
                 const MIN_PEAK_GAP_H = 6; // minst 6h mellan peaks för att räknas som två "tillfällen"
 
                 const peakCandidates = [];
-                // Nattspärr 00–03: om en "peak" råkar ligga på natten så väljer vi istället
-                // bästa (högsta) uttags-timmen senare samma dag (06–23). Då får vi plan även om
-                // användarbeteendet råkar ligga runt midnatt, utan att värma på natten.
-                for (let h = 0; h < 24; h++) {
-                    if (h >= VV_NIGHT_BLOCK_FROM_H && h < VV_NIGHT_BLOCK_TO_H) continue;
-
-                    const v = profile[base + h];
+                // A day runs from 02:00 to 02:00 the next morning, as in daySum above, so a
+                // draw just after midnight belongs to the evening before. Hours are offsets
+                // from the day's midnight (2..25).
+                for (let h = 2; h < 26; h++) {
+                    const v = profile[vvWrap(base + h)];
 
                     if (v > maxV) {
                         maxV = v;
@@ -818,66 +847,39 @@ if (mainHour < 0) continue;
                     : [mainHour];
 
                 for (const peakHour of peakHours) {
-                    // Default-fönster (utan pris):
-                    // Vi jobbar i 1h-buckets: timme h betyder intervallet [h, h+1).
-                    // Målet är att tanken ska vara varm VID STARTEN av förväntat VV-uttag (peak-timmen),
-                    // dvs vi värmer fram till peakHour (inte peakHour+1).
+                    // peak is the peak hour's slot, unwrapped: the window before it may start
+                    // the previous day, or before Monday 00:00.
+                    const peak = base + peakHour;
                     const minHeatLen = Math.max(1, ph); // minst 1h även om ph=0
 
-                    let startHour = 0;
-                    let endHour = 0;
-
-                    if (peakHour <= 0) {
-                        // Peak vid 00:00 kan inte förvärmas "före" inom samma dygn – kör minsta möjliga fönster i början av dagen.
-                        startHour = 0;
-                        endHour = 1;
-                    } else {
-                        endHour = peakHour; // SLUT = start av peak-timmen
-                        startHour = peakHour - minHeatLen;
-                        if (startHour < 0) startHour = 0;
-                    }
-
-                    // Om elprisstyrning är aktiv: välj en billig START inom priceWindowHours före peak,
-                    // men lås alltid SLUTET till peak-start (endHour = peakHour) så planen sträcker sig hela vägen fram.
-                    // Dessutom: start får aldrig bli senare än (peakHour - minHeatLen), annars hinner vi inte värma klart före peak.
-                    if (priceControlEnabled && priceByIndex && peakHour > 0) {
+                    // Heat up to the start of the peak hour, or with price control in the
+                    // cheapest minHeatLen hours within priceWindowHours before it.
+                    let start = peak - minHeatLen;
+                    if (priceControlEnabled && priceByIndex) {
                         const lookback = Math.max(minHeatLen, Math.floor(priceWindowHours));
-                        const winStart = Math.max(0, peakHour - lookback);
-
-                        // Sista tillåtna start så att hela blocket (minHeatLen timmar) får plats före peakHour
-                        const winEnd = Math.min(Math.max(0, peakHour - minHeatLen), 23);
-                        if (winEnd >= winStart) {
-                            let bestStart = null;
-                            let bestSum = Infinity;
-
-                            for (let s = winStart; s <= winEnd; s++) {
-                                let sum = 0;
-                                let ok = true;
-
-                                for (let k = 0; k < minHeatLen; k++) {
-                                    const ore = priceByIndex[base + s + k];
-                                    if (ore === null || !Number.isFinite(ore)) { ok = false; break; }
-                                    sum += ore;
-                                }
-                                if (!ok) continue;
-
-                                // Tie-break: om lika billigt, välj den som ligger SENARE (närmast peak)
-                                if (sum < bestSum || (sum === bestSum && (bestStart === null || s > bestStart))) {
-                                    bestSum = sum;
-                                    bestStart = s;
-                                }
+                        let bestStart = null;
+                        let bestSum = Infinity;
+                        for (let s = peak - lookback; s <= peak - minHeatLen; s++) {
+                            let sum = 0;
+                            let ok = true;
+                            for (let k = 0; k < minHeatLen; k++) {
+                                const ore = priceByIndex[vvWrap(s + k)];
+                                if (ore === null || !Number.isFinite(ore)) { ok = false; break; }
+                                sum += ore;
                             }
-
-                            if (bestStart !== null) {
-                                startHour = bestStart;
-                                endHour = Math.min(peakHour, bestStart + minHeatLen); // FIX: håll fönstret = minHeatLen
+                            if (!ok) continue;
+                            // Tie-break: om lika billigt, välj den som ligger SENARE (närmast peak)
+                            if (sum < bestSum || (sum === bestSum && (bestStart === null || s > bestStart))) {
+                                bestSum = sum;
+                                bestStart = s;
                             }
                         }
+                        if (bestStart !== null) start = bestStart;
                     }
+                    const end = start + minHeatLen;
 
-                    for (let h = startHour; h < endHour; h++) {
-                        if (h >= VV_NIGHT_BLOCK_FROM_H && h < VV_NIGHT_BLOCK_TO_H) continue;
-                        const idx = base + h;
+                    for (let h = start; h < end; h++) {
+                        const idx = vvWrap(h);
                         modePlan[idx] = dayMode;
                         if (dayMode === 1 && Number.isFinite(ecoStop)) {
                             tempPlan[idx] = ecoStop;
@@ -887,6 +889,28 @@ if (mainHour < 0) continue;
                             tempPlan[idx] = luxStop;
                         }
                     }
+
+                    // The cheapest two consecutive hours of the window, ending before the peak.
+                    let cheapStart = null;
+                    if (priceByIndex) {
+                        const from = Math.max(start, peak - Math.max(2, Math.floor(priceWindowHours)));
+                        let bestSum = Infinity;
+                        for (let s = from; s + 1 < end; s++) {
+                            const p1 = priceByIndex[vvWrap(s)];
+                            const p2 = priceByIndex[vvWrap(s + 1)];
+                            if (p1 === null || p2 === null || !Number.isFinite(p1) || !Number.isFinite(p2)) continue;
+                            if (p1 + p2 < bestSum || (p1 + p2 === bestSum && s > cheapStart)) {
+                                bestSum = p1 + p2;
+                                cheapStart = s;
+                            }
+                        }
+                    }
+                    heatBlocks.push({
+                        start: vvWrap(start),
+                        len: minHeatLen,
+                        peak: vvWrap(peak),
+                        cheapStart: cheapStart === null ? null : vvWrap(cheapStart),
+                    });
                 }
             }
             // Min-temp-failsafe: fyller "mellanrummen" när vv_ai_min_temp_enable = true.
@@ -903,6 +927,7 @@ if (mainHour < 0) continue;
             store.tempPlan = tempPlan;
             store.modePlan = modePlan;
             store.meta = store.meta || {};
+            store.meta.vvHeatBlocks = heatBlocks;
             store.meta.lastPlanBuild = Date.now();
         } catch (e) {
             nibe.log(`VV-AI plan build error: ${e}`, 'hotwater', 'error');
@@ -1034,98 +1059,11 @@ function hotwaterAiBuildGraph(store, hw) {
 
 const priceGraphActive = !!priceControlEnabled;
 
-// VV-pris (grön): markera endast de 2 billigaste SAMMANHÄNGANDE timmarna (en 2h-klump)
-// inom prisfönstret före dagens peak (mätt via VV-profilens högsta timme).
-// Detta är en ren graf-mask: VV-planen (orange) kan vara längre, men grön visar "när vi tänker värma".
-const vvPriceHeatMask = new Array(168).fill(false);
+// VV-pris (grön): the hours the control tick may heat in by plan (vvAiPlanHeatAllowed).
+const vvPriceHeatMask = (priceGraphActive && !scheduleGraphActive && store && store.meta)
+    ? vvAiHeatMask(store.meta.vvHeatBlocks)
+    : new Array(168).fill(false);
 
-if (priceGraphActive && !scheduleGraphActive && Array.isArray(priceByIndex) && priceByIndex.length === 168) {
-    // Bygg "VV-pris billigast" utifrån den FAKTISKA VV-planen (modePlan/tempPlan).
-    // Dvs: för varje dags sammanhängande VV-plan-fönster (>=2 timmar) väljer vi den billigaste
-    // 2-timmars-klumpen INOM fönstret. Då kan vi aldrig hamna i läget "VV-plan finns men ingen VV-pris",
-    // även om en natt-peak har flyttats bort i planeringen.
-    //
-    // Nattspärr: markera inte timmar 00:00–03:00 (0,1,2). (Planen försöker också undvika detta.)
-    const NIGHT_BLOCK_FROM_H = 0;
-    const NIGHT_BLOCK_TO_H = 3; // exklusiv
-
-    const pickCheapest2hInRun = (run) => {
-        // run = [{idx, price, temp}] där idx är absolutindex 0..167, och idx ökar med 1
-        if (!Array.isArray(run) || run.length < 2) return null;
-
-        let bestStart = null;
-        let bestCost = Infinity;
-
-        for (let i = 0; i <= run.length - 2; i++) {
-            const idx1 = run[i].idx;
-            const idx2 = run[i + 1].idx;
-
-            const h1 = idx1 % 24;
-            const h2 = idx2 % 24;
-
-            if (h1 >= NIGHT_BLOCK_FROM_H && h1 < NIGHT_BLOCK_TO_H) continue;
-            if (h2 >= NIGHT_BLOCK_FROM_H && h2 < NIGHT_BLOCK_TO_H) continue;
-
-            const p1 = run[i].price;
-            const p2 = run[i + 1].price;
-            if (!Number.isFinite(p1) || !Number.isFinite(p2)) continue;
-
-            const cost = p1 + p2;
-
-            // Tie-break: välj senare block om samma kostnad
-            if (cost < bestCost || (cost === bestCost && (bestStart === null || idx1 > bestStart))) {
-                bestCost = cost;
-                bestStart = idx1;
-            }
-        }
-
-        return bestStart;
-    };
-
-    for (let day = 0; day < 7; day++) {
-        const base = day * 24;
-
-        // Ta ut timmar i denna dag som faktiskt är VV-plan (mode/temp > 0) och har prisdata.
-        const planHours = [];
-        for (let h = 0; h < 24; h++) {
-            const idx = base + h;
-            const m = Number(modePlan[idx]) || 0;
-            const t = Number(tempPlan[idx]) || 0;
-            const pr = priceByIndex[idx];
-
-            if (m > 0 && t > 0 && pr !== null && Number.isFinite(pr)) {
-                planHours.push({ idx, price: pr, temp: t });
-            }
-        }
-
-        if (planHours.length < 2) continue;
-
-        // Bygg sammanhängande "runs" (idx ska vara +1)
-        let run = [planHours[0]];
-        for (let i = 1; i < planHours.length; i++) {
-            const prev = planHours[i - 1];
-            const cur = planHours[i];
-            if (cur.idx === prev.idx + 1) {
-                run.push(cur);
-            } else {
-                // Välj billigaste 2h i tidigare run
-                const best = pickCheapest2hInRun(run);
-                if (best !== null) {
-                    vvPriceHeatMask[best] = true;
-                    vvPriceHeatMask[best + 1] = true;
-                }
-                run = [cur];
-            }
-        }
-
-        // sista run
-        const best = pickCheapest2hInRun(run);
-        if (best !== null) {
-            vvPriceHeatMask[best] = true;
-            vvPriceHeatMask[best + 1] = true;
-        }
-    }
-}
 for (let i = 0; i < 168; i++) {
                 const x = i;
                 const p = Number(profile[i]) || 0;
@@ -1382,11 +1320,8 @@ async function vvAiTick() {
                 String(nowLocal.getDate()).padStart(2, '0');
 
             // Initiera meta-fält för dagstängning och min-temp-failsafe
-            if (typeof store.meta.hwClosedDate !== 'string') {
-                store.meta.hwClosedDate = null;
-            }
-            if (!Number.isFinite(store.meta.hwClosedUntilIdx)) {
-                store.meta.hwClosedUntilIdx = -1;
+            if (!Number.isFinite(store.meta.hwClosedUntilTs)) {
+                store.meta.hwClosedUntilTs = 0;
             }
             if (typeof store.meta.vvMinActive !== 'boolean') {
                 store.meta.vvMinActive = false;
@@ -1937,207 +1872,32 @@ async function vvAiTick() {
                             }
                         }
                     }
-                    // Elprisreglering (vv_ai_use_price_enable):
-                    // När prisstyrning är aktiv vill vi INTE låta VV-AI-planen värma "var som helst".
-                    // Plan-värmning (prio 3) får bara ske under de 2 billigaste SAMMANHÄNGANDE timmarna
-                    // inom prisfönstret före dagens peak (baserat på VV-profilen).
-                    // Min-temp (prio 1) och tidsstyrning (prio 2) påverkas inte.
+                    // Elprisreglering (vv_ai_use_price_enable): plan heating (prio 3) only in the
+                    // hours vvAiBuildPlan picked for its window. Min-temp (prio 1) och tidsstyrning
+                    // (prio 2) påverkas inte.
                     let vvAiCheapHeatAllowedThisHour = true;
                     if (priceControlEnabled && !manualScheduleEnabled) {
-                        try {
-                            const lookback = Math.max(2, Math.floor(priceWindowHours)); // minst 2h
-                            const baseDay = Math.floor(hourIndex / 24) * 24;
-
-                            // Hitta upp till 2 peaks för dagen (>=3.0) med minst 6h mellan.
-                            // Om inga peaks uppfyller tröskeln, fall back till dagens max-timme.
-                            const PEAK_THR = 3.0;
-                            const MIN_SEP_H = 6;
-
-                            const candidates = [];
-
-                            let maxHourAny = -1;
-
-                            let maxValAny = -Infinity;
-
-                            let maxHourAllowed = -1;
-
-                            let maxValAllowed = -Infinity;
-
-
-                            if (Array.isArray(store.profile) && store.profile.length === 168) {
-
-                                for (let h = 0; h < 24; h++) {
-
-                                    const v = Number(store.profile[baseDay + h]);
-
-                                    if (!Number.isFinite(v)) continue;
-
-
-                                    // Fallback-peak (om inga peaks >= PEAK_THR):
-
-                                    // - ANY: bästa timmen oavsett nattspärr (sista nödfall)
-
-                                    // - ALLOWED: bästa timmen utanför nattspärr (normalt)
-
-                                    if (v > maxValAny) {
-
-                                        maxValAny = v;
-
-                                        maxHourAny = h;
-
-                                    }
-
-                                    if (h >= VV_NIGHT_BLOCK_TO_H && v > maxValAllowed) {
-
-                                        maxValAllowed = v;
-
-                                        maxHourAllowed = h;
-
-                                    }
-
-
-                                    // Peaks: ignorera timmar i nattspärren, annars kan prisfönstret hamna före 00:00 och aldrig matcha planen.
-
-                                    if (v >= PEAK_THR && h >= VV_NIGHT_BLOCK_TO_H) {
-
-                                        candidates.push({ h, v });
-
-                                    }
-
-                                }
-
-                            }
-let peakHours = [];
-                            if (candidates.length > 0) {
-                                candidates.sort((a, b) => b.v - a.v);
-                                for (const c of candidates) {
-                                    if (peakHours.length === 0) {
-                                        peakHours.push(c.h);
-                                    } else if (Math.abs(c.h - peakHours[0]) >= MIN_SEP_H) {
-                                        peakHours.push(c.h);
-                                    }
-                                    if (peakHours.length >= 2) break;
-                                }
-                            }
-                            if (peakHours.length === 0) {
-                                const fallbackHour = (maxHourAllowed >= 0) ? maxHourAllowed : maxHourAny;
-                                if (fallbackHour >= 0) {
-                                    peakHours = [fallbackHour];
-                                }
-                            }
-
-                            // Om vi saknar peak (ovanligt), tillåt plan-värmning som fallback
-                            if (!Array.isArray(peakHours) || peakHours.length === 0) {
-                                vvAiCheapHeatAllowedThisHour = true;
-                            } else {
-                                // Tillåt plan-värmning om timmen ingår i någon av dagens 2h-block (en per peak),
-                                // med fallback: om blocket redan passerat tillåt sista 2h före respektive peak.
-                                let allowed = false;
-
-                                for (const peakHour of peakHours) {
-                                    // Sök i [peakHour-lookback, peakHour) alltså timmarna före peak-timmen
-                                    const windowStart = baseDay + Math.max(0, peakHour - lookback);
-                                    const windowEndExclusive = baseDay + Math.max(2, peakHour); // måste ha minst 2h
-
-                                    let bestStart = null;
-                                    let bestSum = Infinity;
-
-                                    // 2h-par måste sluta innan peakHour (dvs start <= peakHour-2)
-                                    const lastStart = baseDay + Math.min(peakHour - 2, 22);
-                                    if (lastStart < windowStart) {
-                                        continue;
-                                    }
-
-                                    for (let i = windowStart; i <= lastStart; i++) {
-                                        const i2 = i + 1;
-
-                                        // Vi tillåter bara par som faktiskt ligger i VV-planen (mode/temp > 0)
-                                        const m1 = (store.modePlan && Number(store.modePlan[i])) || 0;
-                                        const m2 = (store.modePlan && Number(store.modePlan[i2])) || 0;
-                                        const t1 = (store.tempPlan && Number(store.tempPlan[i])) || 0;
-                                        const t2 = (store.tempPlan && Number(store.tempPlan[i2])) || 0;
-                                        if (m1 <= 0 || m2 <= 0 || t1 <= 0 || t2 <= 0) continue;
-
-                                        const p1 = Number(priceByIndex[i]);
-                                        const p2 = Number(priceByIndex[i2]);
-                                        if (!Number.isFinite(p1) || !Number.isFinite(p2)) continue;
-
-                                        const sum = p1 + p2;
-
-                                        // Tie-break: om lika billigt, välj den som ligger SENARE (närmast peak)
-                                        if (sum < bestSum || (sum === bestSum && (bestStart === null || i > bestStart))) {
-                                            bestSum = sum;
-                                            bestStart = i;
-                                        }
-                                    }
-
-                                    // Om vi inte kan beräkna billigast (saknar pris), tillåt fallback
-                                    if (bestStart === null) {
-                                        allowed = true;
-                                        continue;
-                                    }
-
-                                    const cheapAllowed = (hourIndex === bestStart || hourIndex === bestStart + 1);
-
-                                    const peakAbs = baseDay + peakHour;
-                                    const fallbackStart = peakAbs - 2; // 2h före peak
-                                    const fallbackAllowed = (hourIndex === fallbackStart || hourIndex === fallbackStart + 1)
-                                        && hourIndex > (bestStart + 1) // billigaste blocket passerat
-                                        && hourIndex < peakAbs;        // inte efter peak-start
-
-                                    if (cheapAllowed || fallbackAllowed) {
-                                        allowed = true;
-                                    }
-                                }
-
-                                vvAiCheapHeatAllowedThisHour = allowed;
-                            }
-} catch (e) {
-                            vvAiCheapHeatAllowedThisHour = true; // safe fallback
-                        }
+                        vvAiCheapHeatAllowedThisHour = vvAiPlanHeatAllowed(store && store.meta && store.meta.vvHeatBlocks, hourIndex);
                     }
 
-                    // 3) VV-AI-veckoplan (en "klump" per dag, dagstängning via store.meta.hwClosedDate)
+                    // 3) VV-AI-veckoplan: once BT7 reaches the target, the rest of the window is
+                    //    closed, also across midnight; a later window (a second peak) still heats.
                     if (!wantHeat && aiOk && Number.isFinite(bt7Now) && planMode > 0 && planTemp !== null && (!priceControlEnabled || vvAiCheapHeatAllowedThisHour)) {
-                        const currentClosedDate = (store && store.meta && typeof store.meta.hwClosedDate === 'string')
-                            ? store.meta.hwClosedDate
-                            : null;
-                                                const closedUntilIdx = (store && store.meta && Number.isFinite(store.meta.hwClosedUntilIdx))
-                            ? store.meta.hwClosedUntilIdx
-                            : -1;
-
-                        // Om dag bytts sedan vi stängde en klump – nollställ index.
-                        if (store && store.meta && currentClosedDate !== todayStr && store.meta.hwClosedUntilIdx !== -1) {
-                            store.meta.hwClosedUntilIdx = -1;
-                        }
-
-                        const closedToday = (currentClosedDate === todayStr) && (hourIndex <= closedUntilIdx);
-
-                        if (!closedToday) {
+                        const closedUntilTs = (store && store.meta && Number.isFinite(store.meta.hwClosedUntilTs))
+                            ? store.meta.hwClosedUntilTs
+                            : 0;
+                        if (ts >= closedUntilTs) {
                             targetTemp = planTemp;
                             wantHeat = (bt7Now < targetTemp);
-
-                                                        // Om vi redan är över target: stäng nuvarande "klump" (block) för idag,
-                            // men tillåt senare uppvärmning samma dag om det finns en ny klump (t.ex. 2 peaks).
-                            if (bt7Now >= targetTemp) {
-                                let endIdx = hourIndex;
-                                try {
-                                    const hourInDay = nowLocal.getHours();
-                                    const dayStartIdx = hourIndex - hourInDay;
-                                    const endLimit = dayStartIdx + 23;
-                                    while (endIdx < endLimit && store && Array.isArray(store.tempPlan) &&
-                                           Number.isFinite(store.tempPlan[endIdx + 1]) && store.tempPlan[endIdx + 1] > 0) {
-                                        endIdx++;
-                                    }
-                                } catch (e) {
-                                    // ignore
+                            if (!wantHeat) {
+                                let rest = 0;
+                                while (rest < 23 && Array.isArray(store.tempPlan) &&
+                                       Number(store.tempPlan[vvWrap(hourIndex + rest + 1)]) > 0) {
+                                    rest++;
                                 }
-
-                                if (store && store.meta) {
-                                    store.meta.hwClosedDate = todayStr;
-                                    store.meta.hwClosedUntilIdx = endIdx;
-                                }
-                                wantHeat = false;
+                                const hourStart = new Date(ts);
+                                hourStart.setMinutes(0, 0, 0);
+                                store.meta.hwClosedUntilTs = hourStart.getTime() + (rest + 1) * 3600000;
                             }
                         }
                     }
