@@ -1890,9 +1890,11 @@ async function vvAiTick() {
                             targetTemp = planTemp;
                             wantHeat = (bt7Now < targetTemp);
                             if (!wantHeat) {
+                                // modePlan, not tempPlan: with the min-temp floor on, tempPlan
+                                // is non-zero in every hour, and the window would never end.
                                 let rest = 0;
-                                while (rest < 23 && Array.isArray(store.tempPlan) &&
-                                       Number(store.tempPlan[vvWrap(hourIndex + rest + 1)]) > 0) {
+                                while (rest < 23 && Array.isArray(store.modePlan) &&
+                                       Number(store.modePlan[vvWrap(hourIndex + rest + 1)]) > 0) {
                                     rest++;
                                 }
                                 const hourStart = new Date(ts);
