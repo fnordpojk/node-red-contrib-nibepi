@@ -1111,8 +1111,10 @@ for (let i = 0; i < 168; i++) {
                     tempSeries.push({ x, y: planY });
                     modeSeries.push({ x, y: modeY });
                 } else {
-                    // Standard: visa AI-planen (tempPlan och modePlan) som tidigare
-                    tempSeries.push({ x, y: Number(t.toFixed(1)) });
+                    // Standard: visa AI-planen (tempPlan och modePlan). Only inside the windows:
+                    // with the min-temp floor on, tempPlan holds the floor in every other hour,
+                    // which would draw as a plan to heat around the clock.
+                    tempSeries.push({ x, y: m > 0 ? Number(t.toFixed(1)) : 0 });
                     modeSeries.push({ x, y: m });
                 }
 
