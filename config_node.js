@@ -2133,6 +2133,42 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
         }
     }
     const getList = [];
+    // A plugin registers once, when it starts, and the read that checks its system
+    // exists can fail: the pump does not answer every request, and fewer of them
+    // when another client shares the gateway. A failed check used to leave the
+    // plugin out - silently, until its settings were touched. Keep retrying until
+    // the pump answers, or until the plugin registers again and supersedes this.
+    // A superseded request settles neither way, so it cannot overwrite the newer
+    // registration's outcome.
+    const PLUGIN_RETRY_MS = 60000;
+    const pluginGeneration = {};
+    const pluginRetryTimers = new Set();
+    function reqDataForPlugin(register,plugin,system,generation) {
+        const key = plugin+'_'+system;
+        return new Promise((resolve,reject) => {
+            let failures = 0;
+            const attempt = () => {
+                nibe.reqData(register).then(data => {
+                    if(pluginGeneration[key]!==generation) return;
+                    if(failures>0) nibe.log(`Plugin ${plugin} (${system}) registered after ${failures} failed read(s) of register ${register}`,'error','debug');
+                    resolve(data);
+                }).catch(err => {
+                    if(pluginGeneration[key]!==generation) return;
+                    const message = (err && err.message) ? err.message : String(err);
+                    // A register the pump does not have will not appear on retry.
+                    if(message.includes('not in database')) return reject(err);
+                    if(failures===0) nibe.log(`Plugin ${plugin} (${system}) could not read register ${register} (${message}), retrying every minute`,'error','debug');
+                    failures++;
+                    const timer = setTimeout(() => {
+                        pluginRetryTimers.delete(timer);
+                        if(pluginGeneration[key]===generation) attempt();
+                    }, PLUGIN_RETRY_MS);
+                    pluginRetryTimers.add(timer);
+                });
+            };
+            attempt();
+        });
+    }
     function clearList(plugin,system) {
         const promise = new Promise((resolve,reject) => {
             for( var i = 0; i < getList.length; i++){
@@ -2160,6 +2196,8 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
     }
     async function initiatePlugin(arrData,plugin,system="s1") {
         let arr = arrData.slice();
+        const generation = (pluginGeneration[plugin+'_'+system] || 0)+1;
+        pluginGeneration[plugin+'_'+system] = generation;
         const promise = new Promise((resolve,reject) => {
             clearList(plugin,system).then(result => {
                 var newSystem = true;
@@ -2237,14 +2275,14 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                     let regN = getList.findIndex(regN => regN.system == system);
                     if(regN===-1) {
                         checkRMU();
-                        nibe.reqData(checkReg).then(data => {
+                        reqDataForPlugin(checkReg,plugin,system,generation).then(data => {
                             if(data.data<-3276) {
                                 checkRMU();
                                 return reject(false);
                             } else {
                                 systems[system] = true;
                                 if(plugin=="fan") {
-                                    nibe.reqData(hP.bs1_flow).then(data => {
+                                    reqDataForPlugin(hP.bs1_flow,plugin,system,generation).then(data => {
                                         if(data.data<-3276) {
                                             return reject(false);
                                         } else {
@@ -2321,14 +2359,14 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
 
                     } else {
                         checkRMU();
-                        nibe.reqData(checkReg).then(data => {
+                        reqDataForPlugin(checkReg,plugin,system,generation).then(data => {
                             if(data.data<-3276) {
                                 checkRMU();
                                 return reject(false);
                             } else {
                                 systems[system] = true;
                                 if(plugin=="fan") {
-                                    nibe.reqData(hP.bs1_flow).then(data => {
+                                    reqDataForPlugin(hP.bs1_flow,plugin,system,generation).then(data => {
                                         if(data.data<-3276) {
                                             return reject(false);
                                         } else {
@@ -2349,14 +2387,14 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                     }
                 } else {
                     checkRMU();
-                    nibe.reqData(checkReg).then(data => {
+                    reqDataForPlugin(checkReg,plugin,system,generation).then(data => {
                         if(data.data<-3276) {
                             checkRMU();
                             return reject(false);
                         } else {
                             systems[system] = true;
                             if(plugin=="fan") {
-                                nibe.reqData(hP.bs1_flow).then(data => {
+                                reqDataForPlugin(hP.bs1_flow,plugin,system,generation).then(data => {
                                     if(data.data<-3276) {
                                         return reject(false);
                                     } else {
@@ -2379,7 +2417,26 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
     });
     return promise;
 }
-    async function updateData(hourly=false) {
+    // updateData runs from cron and from the dashboard without anyone awaiting it,
+    // so an error in it was an unhandled rejection, and Node exits on those. A
+    // plugin that threw over a register whose read had timed out restarted
+    // Node-RED. Report the error and carry on instead, and keep one plugin's
+    // error from stopping the others.
+    const reportPluginError = (name,err) => {
+        console.error(`${name} failed:`, err);
+        nibe.log(`${name} failed: ${(err && err.message) ? err.message : err}`,'error','error');
+    };
+    const runSafely = (name,fn) => {
+        try {
+            Promise.resolve(fn()).catch(err => reportPluginError(name,err));
+        } catch (err) {
+            reportPluginError(name,err);
+        }
+    };
+    function updateData(hourly=false) {
+        return collectAndRun(hourly).catch(err => reportPluginError('updateData',err));
+    }
+    async function collectAndRun(hourly) {
         let timeNow = Date.now();
         /*
         Check emitters
@@ -2445,17 +2502,19 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                     }
                 }
             }
-            runIndoor(result,array);
-            runPrice(result,array);
-            runRMU(result,array);
+            runSafely('Inomhusreglering',() => runIndoor(result,array));
+            runSafely('Elprisreglering',() => runPrice(result,array));
+            runSafely('RMU',() => runRMU(result,array));
             if(hourly===true) {
                 result.array = array;
-                runWeather(result);
+                runSafely('Prognosreglering',() => runWeather(result));
             } else {
                 result.array = array;
-                if(nibe.getConfig().weather['enable_'+item.system]===true) {
-                    nibeData.emit('pluginWeather',result);
-                }
+                runSafely('Prognosreglering',() => {
+                    if(nibe.getConfig().weather['enable_'+item.system]===true) {
+                        nibeData.emit('pluginWeather',result);
+                    }
+                });
             }
             nibeData.emit('updateGraph');
         }
@@ -2561,6 +2620,13 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
             if(config.weather.enable_down===undefined) {
                 config.weather.enable_down = true
                 nibe.setConfig(config);
+            }
+            if(val.outside===undefined) {
+                val.outside = await getNibeData(hP['outside']).catch(console.log)
+            }
+            if(val.outside===undefined) {
+                nibe.log(`Kunde inte läsa utomhustemperaturen, hoppar över prognosreglering.`,'weather','error');
+                return;
             }
             let outside = val.outside.data;
             nibe.log(`Aktuell utomhustemperatur: ${outside}`,'weather','debug');
@@ -2833,6 +2899,19 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
         let factor = data['inside_factor_'+data.system];
         let dM = data.dM;
         let dMstart = data.dMstart;
+        // A read that timed out leaves its register out of data. Skip this run
+        // rather than regulate on a value that is not there; the next one reads again.
+        const enabled = conf.indoor['enable_'+data.system]===true;
+        const dmReset = conf.indoor.dm_reset_enable===true && conf.system.pump!=="F370" && conf.system.pump!=="F470";
+        const missing = [];
+        if(inside_set===undefined) missing.push('inside_set_'+data.system);
+        if(enabled && factor===undefined) missing.push('inside_factor_'+data.system);
+        if(dmReset && dM===undefined) missing.push('dM');
+        if(dmReset && dMstart===undefined) missing.push('dMstart');
+        if(missing.length>0) {
+            nibe.log(`Inomhusreglering (${data.system}): saknar värde för ${missing.join(', ')}, hoppar över.`,'error','debug');
+            return;
+        }
         // Calculate setpoint accuracy
         if(inside!==undefined) {
             indoorArray.unshift({set:inside_set.data,act:inside.data});
@@ -2901,6 +2980,18 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
         let inside = data.priceSensor;
         nibe.log(`Startar elprisjustering priceAdjustCurve() för ${data.system}`,'price','debug');
         let config = nibe.getConfig();
+        // A read that timed out leaves its register out of data. Skip this run
+        // rather than adjust on a value that is not there; the next one reads again.
+        const missing = [];
+        if(data['inside_set_'+system]===undefined) missing.push('inside_set_'+system);
+        if(config.system.pump!=="F370" && config.system.pump!=="F470") {
+            if(data.dM===undefined) missing.push('dM');
+            if(data.dMstart===undefined) missing.push('dMstart');
+        }
+        if(missing.length>0) {
+            nibe.log(`Elprisreglering (${system}): saknar värde för ${missing.join(', ')}, hoppar över.`,'price','debug');
+            return;
+        }
 
 
             // Defaults for VAT and AI display surcharge (in öre).
@@ -3800,7 +3891,7 @@ try {
                 }
 
                 if (true) {
-                    priceAdjustCurve(data);
+                    priceAdjustCurve(data).catch(err => reportPluginError('Elprisreglering',err));
                     adjustPool(data,data.system)
                     .then(pool => {
                         if(pool!==undefined){ nibe.log('POOL-EMIT sys='+data.system,'price','debug'); nibeData.emit('pluginPriceGraphPool',priceBuildPoolGraph(heat,data.system)); }
@@ -3820,7 +3911,7 @@ try {
             nibe.log(`Källan är Nibe`,'price','debug');
             data.price_level = await getNibeData(hP['price_level']).catch(console.log);
             data.price_enable = await getNibeData(hP['price_enable']).catch(console.log);
-            priceAdjustCurve(data)
+            priceAdjustCurve(data).catch(err => reportPluginError('Elprisreglering',err));
             data.price_current = await getNibeData(hP['price_current']).catch(console.log);
             nibeData.emit('pluginPriceGraph',nibeBuildGraph(data,data.system));
             nibeData.emit('pluginPrice',data);
@@ -4051,7 +4142,7 @@ try {
                 }
 
                 if (true) {
-                    priceAdjustCurve(data);
+                    priceAdjustCurve(data).catch(err => reportPluginError('Elprisreglering',err));
                     adjustPool(data,data.system)
                     .then(pool => {
                         if(pool!==undefined){ nibe.log('POOL-EMIT sys='+data.system,'price','debug'); nibeData.emit('pluginPriceGraphPool',priceBuildPoolGraph(heat,data.system)); }
@@ -5681,6 +5772,8 @@ const checkTranslation = (node) => {
             tenminutes.stop();
             hourly.stop();
             clearTimeout(timer.diagnostic);
+            for (const t of pluginRetryTimers) clearTimeout(t);
+            pluginRetryTimers.clear();
         });
     }
 

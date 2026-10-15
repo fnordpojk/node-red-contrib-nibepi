@@ -86,7 +86,7 @@ module.exports = function(RED) {
             if(data.system===config.system) {
                 let outside = data['outside'];
                 //server.nibeData.emit('forecast_1',arr,config.system);
-                this.send({topic:"Utomhustemperatur",payload:outside.data});
+                if(outside!==undefined) this.send({topic:"Utomhustemperatur",payload:outside.data});
                 this.send({topic:"Kurvjustering",payload:data.weatherOffset});
                 //if(data.predictedNow!==undefined) this.send({topic:"Nuvarande prognos",payload:data.predictedNow.payload,timestamp:data.predictedNow.timestamp});
                 if(data.predictedLater!==undefined) this.send({topic:"Prognos",payload:data.predictedLater.payload,timestamp:data.predictedLater.timestamp});

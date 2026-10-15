@@ -13,8 +13,13 @@ module.exports = function(RED) {
         this.on('close', function() {
             for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
             __subs.length = 0;
+            clearTimeout(retryTimer);
         });
+        let retryTimer;
+        let startUpRun = 0;
         async function startUp() {
+            clearTimeout(retryTimer);
+            const run = ++startUpRun;
             let system = config.system.replace('s','S');
             let conf = server.nibe.getConfig();
             node.status({ fill: 'yellow', shape: 'dot', text: `System ${system}` });
@@ -49,8 +54,20 @@ module.exports = function(RED) {
                     arr.push(insideSensor);
                 }
             }
-            let nibe_enabled = await server.nibe.reqData(server.hP()["inside_enable_"+config.system]).catch(console.log);
-            if(nibe_enabled===undefined || nibe_enabled.data===undefined || nibe_enabled.data!==1 && conf.indoor['enable_'+config.system]!==true){ arr = [];}
+            // Registered when NibePi's indoor control is on, or the pump's own room
+            // sensor setting is. A failed read of the latter used to count as off,
+            // and left indoor control unregistered even when it was switched on here.
+            if(conf.indoor['enable_'+config.system]!==true) {
+                let readError;
+                let nibe_enabled = await server.nibe.reqData(server.hP()["inside_enable_"+config.system]).catch(err => { readError = err; });
+                if(run!==startUpRun) return;
+                if(readError!==undefined && !String(readError.message || readError).includes('not in database')) {
+                    console.log(readError);
+                    retryTimer = setTimeout(startUp, 60000);
+                    return;
+                }
+                if(nibe_enabled===undefined || nibe_enabled.data!==1) arr = [];
+            }
                 server.initiatePlugin(arr,'indoor',config.system).then(data => {
                     node.status({ fill: 'green', shape: 'dot', text: `System ${system}` });
                     node.send({enabled:true});
@@ -103,7 +120,7 @@ module.exports = function(RED) {
                 if(data.indoorOffset!==undefined) {
                     node.send({topic:"Kurvjustering",payload:data.indoorOffset});
                 }
-                node.send({topic:"Tid",payload:outside.timestamp});
+                if(outside!==undefined) node.send({topic:"Tid",payload:outside.timestamp});
                 node.send({topic:"Avvikelse",payload:data.accuracy});
             }
         })
