@@ -2143,22 +2143,24 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
     const PLUGIN_RETRY_MS = 60000;
     const pluginGeneration = {};
     const pluginRetryTimers = new Set();
+    // Plugins whose failed read was logged, so the read that finally answers is
+    // logged too - also when it comes from a newer registration than the failed one.
+    const pluginReadFailed = new Set();
     function reqDataForPlugin(register,plugin,system,generation) {
         const key = plugin+'_'+system;
         return new Promise((resolve,reject) => {
-            let failures = 0;
             const attempt = () => {
                 nibe.reqData(register).then(data => {
                     if(pluginGeneration[key]!==generation) return;
-                    if(failures>0) nibe.log(`Plugin ${plugin} (${system}) registered after ${failures} failed read(s) of register ${register}`,'error','debug');
+                    if(pluginReadFailed.delete(key)) nibe.log(`Plugin ${plugin} (${system}) read register ${register} after earlier failures`,'error','debug');
                     resolve(data);
                 }).catch(err => {
                     if(pluginGeneration[key]!==generation) return;
                     const message = (err && err.message) ? err.message : String(err);
                     // A register the pump does not have will not appear on retry.
                     if(message.includes('not in database')) return reject(err);
-                    if(failures===0) nibe.log(`Plugin ${plugin} (${system}) could not read register ${register} (${message}), retrying every minute`,'error','debug');
-                    failures++;
+                    if(!pluginReadFailed.has(key)) nibe.log(`Plugin ${plugin} (${system}) could not read register ${register} (${message}), retrying every minute`,'error','debug');
+                    pluginReadFailed.add(key);
                     const timer = setTimeout(() => {
                         pluginRetryTimers.delete(timer);
                         if(pluginGeneration[key]===generation) attempt();
