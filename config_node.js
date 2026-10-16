@@ -2143,16 +2143,18 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
     const PLUGIN_RETRY_MS = 60000;
     const pluginGeneration = {};
     const pluginRetryTimers = new Set();
-    // Plugins whose failed read was logged, so the read that finally answers is
-    // logged too - also when it comes from a newer registration than the failed one.
+    // Plugins whose failed read was logged, so how their registration finally
+    // turns out is logged too - also when a newer registration settles it.
     const pluginReadFailed = new Set();
+    function logPluginOutcome(plugin,system,outcome) {
+        if(pluginReadFailed.delete(plugin+'_'+system)) nibe.log(`Plugin ${plugin} (${system}) ${outcome}`,'error','debug');
+    }
     function reqDataForPlugin(register,plugin,system,generation) {
         const key = plugin+'_'+system;
         return new Promise((resolve,reject) => {
             const attempt = () => {
                 nibe.reqData(register).then(data => {
                     if(pluginGeneration[key]!==generation) return;
-                    if(pluginReadFailed.delete(key)) nibe.log(`Plugin ${plugin} (${system}) read register ${register} after earlier failures`,'error','debug');
                     resolve(data);
                 }).catch(err => {
                     if(pluginGeneration[key]!==generation) return;
@@ -2239,7 +2241,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                 let checkReg = hP['supply_'+system];
                 function checkRMU() {
                     if(plugin=="rmu") {
-                        nibe.reqData(hP['startHW_rmu_'+system]).then(data => {
+                        reqDataForPlugin(hP['startHW_rmu_'+system],plugin,system,generation).then(data => {
                             if(data!==undefined) {
                                 let regN = getList.findIndex(regN => regN.system == 's1');
                                 if(regN!==-1) {
@@ -2417,6 +2419,10 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                 }
         })
     });
+    // Every rejection above means the pump answered that the system or sensor is
+    // not there; a read that keeps failing retries instead of rejecting.
+    promise.then(() => logPluginOutcome(plugin,system,'registered after earlier failed reads'),
+                 () => logPluginOutcome(plugin,system,'not registered: not present on this pump'));
     return promise;
 }
     // updateData runs from cron and from the dashboard without anyone awaiting it,
