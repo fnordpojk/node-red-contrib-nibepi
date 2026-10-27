@@ -46,7 +46,7 @@ One of four repositories:
 ## Requirements
 
 - Node.js 20 or newer
-- Node-RED 3 or newer — developed against 5.0.7
+- Node-RED 3 or newer — developed against 5.0.9
 - A way to reach the pump: an RS485 adapter, a NibeGW gateway over UDP, or
   Modbus TCP for S-series
 - Modbus enabled on the pump itself — see
@@ -97,6 +97,29 @@ cd ~/.node-red
 cp -a node_modules/node-red-contrib-nibepi node-red-contrib-nibepi.bak
 cp flows.json flows.json.bak
 ```
+
+## Development
+
+The files at the top level are the Node-RED nodes. `config_node.js` is the
+configuration node: the connection to the pump, the schedules and the editor's
+HTTP endpoints. The features live in `lib/`, one module each:
+
+| module | |
+|---|---|
+| `shared.js` | pump reads with a short cache, the graph store, heat curve adjustments, errors to the dashboard |
+| `plugins.js` | which registers each feature needs, and the regular run that reads them and runs the features |
+| `price.js`, `price-trading.js` | price control, and the algorithm that turns prices into levels |
+| `vvai.js` | VV-AI hot water learning and control |
+| `weather.js`, `indoor.js`, `hotwater.js`, `fan.js`, `diagnostic.js`, `rmu.js` | the other features |
+
+Each module is a function that takes a shared `ctx` object, picks what it needs
+from it and returns what it offers; `config_node.js` creates them in dependency
+order. State that is replaced while running, such as the register map `hP`, is
+always read through `ctx`, never copied.
+
+`npm test` runs the characterization traces in
+[test/characterize](test/characterize/README.md): scenarios against a simulated
+pump whose recorded behavior a change must reproduce.
 
 ## License
 
