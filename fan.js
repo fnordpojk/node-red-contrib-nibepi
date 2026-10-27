@@ -17,32 +17,12 @@ module.exports = function(RED) {
             let system = config.system.replace('s','S');
             this.status({ fill: 'yellow', shape: 'dot', text: `System ${system}` });
             const arr = [
-                /*{topic:"bs1_flow",source:"nibe"},
-                {topic:"fan_speed",source:"nibe"},
-                {topic:"alarm",source:"nibe"},
-                {topic:"vented",source:"nibe"},
-                {topic:"cpr_set",source:"nibe"},
-                {topic:"cpr_act",source:"nibe"}*/
             ];
             let conf = server.nibe.getConfig();
             if(conf.fan===undefined) {
                 conf.fan = {};
                 server.nibe.setConfig(conf);
             }
-            /*
-            if(conf.home.inside_sensors===undefined) {
-                conf.home.inside_sensors = [];
-                server.nibe.setConfig(conf);
-            }
-            if(conf.fan.sensor===undefined || conf.fan.sensor=="Ingen") {
-                
-            } else {
-                let index = conf.home.inside_sensors.findIndex(i => i.name == conf.fan.sensor);
-                if(index!==-1) {
-                    var co2Sensor = Object.assign({}, conf.home.inside_sensors[index]);
-                    arr.push(co2Sensor);
-                }
-            }*/
         server.initiatePlugin(arr,'fan',config.system).then(data => {
             this.status({ fill: 'green', shape: 'dot', text: `System ${system}` });
             this.send({enabled:true});

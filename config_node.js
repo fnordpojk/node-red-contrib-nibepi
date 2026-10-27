@@ -2390,14 +2390,6 @@ async function vvAiTick() {
     }
     async function collectAndRun(hourly) {
         let timeNow = Date.now();
-        /*
-        Check emitters
-        let events = nibeData.eventNames()
-        console.log(JSON.stringify(events,null,2));
-        for (const item of events) {
-            let count = nibeData.listenerCount(item)
-            console.log(`Eventname: ${item}, Count: ${count}`);
-        }*/
         for (const item of getList) {
             const array = [];
             let result = {timestamp:timeNow};

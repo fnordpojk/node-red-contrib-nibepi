@@ -72,9 +72,6 @@ module.exports = function(RED) {
             }
         })
     }
-        /*nibe.data.on(register, data => {
-                node.status({ fill: 'red', shape: 'dot', text: data });
-        })*/
     if(config.name.toLowerCase()=="config") {
         sub('config', data => {
             node.send([{topic:"config",payload:data},null]);
