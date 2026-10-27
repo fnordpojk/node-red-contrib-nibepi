@@ -294,31 +294,6 @@
       "EN": "<p><b>MQTT</b></p><br>Activate the MQTT broker.<br>NibePi has an internal MQTT broker that runs on 127.0.0.1:1883, You can also use an external broker just by changing the connection details. Activate HA auto discovery, if Home Assistant should detect NibePi's sensors automatically.",
       "DE": "<p><b>MQTT</b></p><br>Aktiviert den MQTT broker.<br>NibePi hat einen internen MQTT Broker, der auf 127.0.0.1:1883 läuft.<br>Wenn deaktiviert, kann hier ein externer Broker angegeben werden.<br>Aktiviere HA Auto Discovery, wenn HomeAssistant die NibePi Sensoren automatisch erkennen soll."
     },
-    "plejd_info": {
-      "SE": "<p><b>Plejd</b></p><br>Aktivera Plejd MQTT Gateway.<br>NibePi kan simulera en Plejd MQTT Gateway via ett projekt som heter plejd2mqtt.<br>Home Assistant/OpenHAB kan automatiskt upptäcka Plejdenheterna via MQTT Discovery<br>Ange den MQTT Broker nedan som gatewayen ska ansluta till.<br>NibePi har en inbyggd broker på 127.0.0.1:1883<br>",
-      "EN": "<p><b>Plejd</b></p><br>Activate the Plejd MQTT Gateway.<br>NibePi can simulate a Plejd MQTT Gateway via a project called plejd2mqtt.<br>Home Assistant/OpenHAB can automatically discover the Plejd devices via MQTT Discovery<br>Enter the MQTT Broker below that the gateway should connect to.<br>NibePi has a built-in broker at 127.0.0.1:1883<br>",
-      "DE": "<p><b>Plejd</b></p><br>Plejd MQTT Gateway aktivieren.<br>NibePi kann ein Plejd MQTT Gateway über ein Projekt namens plejd2mqtt simulieren.<br>Home Assistant/OpenHAB kann The automatisch erkennen Pleid-Geräte über MQTT Discovery<br>Geben Sie unten den MQTT-Broker ein, mit dem sich das Gateway verbinden soll.<br>NibePi hat einen integrierten Broker unter 127.0.0.1:1883<br>"
-    },
-    "plejd_login": {
-      "SE": "Ange Inloggningsinformation till Plejds molntjänst för att få kontakt med enheterna<br>OBS. Vid ändringar behöver gatewayen startas om<br>",
-      "EN": "Enter login information to Plejd's cloud service to connect with the devices<br>NOTE. In case of changes, the gateway needs to be restarted<br>",
-      "DE": "Geben Sie die Anmeldeinformationen für den Cloud-Dienst von Plejd ein, um sich mit den Geräten zu verbinden<br>HINWEIS. Bei Änderungen muss das Gateway neu gestartet werden<br>"
-    },
-    "cloud_name": {
-      "SE": "<b>Anläggning</b>",
-      "EN": "<b>Place</b>",
-      "DE": "<b>Ort</b>"
-    },
-    "cloud_user": {
-      "SE": "<b>E-post</b>",
-      "EN": "<b>E-mail</b>",
-      "DE": "<b>Email</b>"
-    },
-    "cloud_pass": {
-      "SE": "<b>Lösenord</b>",
-      "EN": "<b>Password</b>",
-      "DE": "<b>Passwort</b>"
-    },
     "lat": {
       "SE": "<b>Latitud</b>",
       "EN": "<b>Latitude</b>",
