@@ -99,10 +99,10 @@ module.exports = function(RED) {
                 this.send({topic:"Graf",payload:data.values});
             }
         });
-        // === FIX: forward pool graph as its own topic so Price 1.1 can route it ===
+        // Forward the pool graph as its own topic so Price 1.1 can route it.
         sub('pluginPriceGraphPool', (data) => {
             if(data.system===config.system) {
-                this.warn("POOL-GRAPH sys="+data.system+" len="+(data.values?data.values.length:0)); this.send({topic:"Graf Pool",payload:[]});
+                this.send({topic:"Graf Pool",payload:[]});
                 this.send({topic:"Graf Pool",payload:data.values});
             }
         });
