@@ -84,18 +84,6 @@ module.exports = function(RED) {
             }
         })
         sub('pluginFan', (data) => {
-                let co2 = data.co2Sensor;
-                let low_co2_limit = data.low_co2_limit;
-                let high_co2_limit = data.high_co2_limit;
-                if(co2!==undefined && co2.data!==undefined && co2.data.data>0) {
-                    //this.send({topic:"CO2",payload:co2.data.data});
-                }
-                if(low_co2_limit!==undefined) {
-                    //this.send({topic:"CO2 Gränsvärde för sänkt flöde.",payload:low_co2_limit});
-                }
-                if(high_co2_limit!==undefined) {
-                    //this.send({topic:"CO2 Gränsvärde för ökat flöde.",payload:high_co2_limit});
-                }
                 if(data.filter_eff!==undefined) {
                     this.send({topic:"Filtereffektivitet",payload:data.filter_eff});
                 }

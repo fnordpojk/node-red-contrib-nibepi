@@ -36,7 +36,6 @@ module.exports = function(RED) {
                 let index = conf.home.inside_sensors.findIndex(i => i.name == conf.weather['sensor_'+config.system]);
                 if(index!==-1) {
                     var insideSensor = Object.assign({}, conf.home.inside_sensors[index]);
-                    //let insideSensor = conf.home.inside_sensors[index];
                     arr.push(insideSensor);
                 }
             }
@@ -88,7 +87,6 @@ module.exports = function(RED) {
                 //server.nibeData.emit('forecast_1',arr,config.system);
                 if(outside!==undefined) this.send({topic:"Utomhustemperatur",payload:outside.data});
                 this.send({topic:"Kurvjustering",payload:data.weatherOffset});
-                //if(data.predictedNow!==undefined) this.send({topic:"Nuvarande prognos",payload:data.predictedNow.payload,timestamp:data.predictedNow.timestamp});
                 if(data.predictedLater!==undefined) this.send({topic:"Prognos",payload:data.predictedLater.payload,timestamp:data.predictedLater.timestamp});
                 if(data.unfiltredTemp!==undefined) this.send({topic:"Ojusterad Prognos",payload:data.unfiltredTemp.payload,timestamp:data.unfiltredTemp.timestamp});
                 this.send([null,{topic:"Vindgraf",payload:data.windGraph}]);

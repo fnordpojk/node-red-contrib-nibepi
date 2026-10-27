@@ -15,13 +15,11 @@ module.exports = function(RED) {
         });
         let node = this;
         let timeFrame;
-        let translate = server.translate.dash;
         function buildGraph(arr) {
             let timeNow = Date.now();
             if(timeFrame===undefined) timeFrame = (24*60*60*1000);
             let timeCut = timeNow-timeFrame;
             let savedData = server.savedData();
-            //let savedGraph = Object.assign({}, ...server.savedGraph())
             let savedGraph = server.savedGraph();
             var array = [
                 {
@@ -286,8 +284,6 @@ module.exports = function(RED) {
                         }
                     }
                     return register
-                } else {
-                    return;
                 }
             }
             if(customGraph('electric_price')!==undefined) list.unshift(customGraph('electric_price'));
@@ -295,7 +291,6 @@ module.exports = function(RED) {
             return(list)
         }
         node.on('close', function() {
-            let system = config.system.replace('s','S');
             node.status({ fill: 'yellow', shape: 'dot', text: `` });
         });
     }

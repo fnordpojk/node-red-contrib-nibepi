@@ -58,7 +58,6 @@ module.exports = function(RED) {
             if(msg.topic=="update") {
                 let data = {system:config.system}
                 server.updateData(data);
-                return;
             } else if(msg.topic=="price/enable") {
                 let req = msg.topic.split('/');
                 if(conf[req[0]]===undefined) conf[req[0]] = {};

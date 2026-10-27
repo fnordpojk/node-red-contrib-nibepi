@@ -31,9 +31,7 @@ module.exports = function(RED) {
         if(config.name=="") {
             sub('data', data => {
                 let saved = node.context().get(data.register);
-                if(data.error!==undefined) {
-                    
-                } else {
+                if(data.error===undefined) {
                     if(saved!=data.data) {
                         node.send([{topic:data.register,payload:data.data},{topic:data.register,payload:data.data,raw:data}]);
                         node.context().set(data.register, data.data);
@@ -61,9 +59,7 @@ module.exports = function(RED) {
         sub(register, data => {
             if(register===data.register) {
                 let saved = node.context().get(data.register);
-                if(data.error!==undefined) {
-                    
-                } else {
+                if(data.error===undefined) {
                     if(saved!=data.data) {
                         node.send([{topic:data.register,payload:data.data,raw:data},{topic:data.register,payload:data.data,raw:data}]);
                         node.context().set(data.register, data.data);

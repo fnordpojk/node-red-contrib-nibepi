@@ -2,7 +2,6 @@ module.exports = function(RED) {
     const EventEmitter = require('events').EventEmitter;
     require('events').EventEmitter.defaultMaxListeners = 850;
     const https = require('https');
-    //const http = require('http');
     const fs = require('fs');
     const path = require('path');
     // Robust bool-tolkning (Node-RED kan ibland ge true/false som strängar)
@@ -11,14 +10,6 @@ module.exports = function(RED) {
         if (typeof v === 'string') {
             const s = v.trim().toLowerCase();
             return (s === 'true' || s === '1' || s === 'on' || s === 'yes');
-        }
-        return false;
-    };
-    const vvAiIsFalse = (v) => {
-        if (v === false || v === 0) return true;
-        if (typeof v === 'string') {
-            const s = v.trim().toLowerCase();
-            return (s === 'false' || s === '0' || s === 'off' || s === 'no');
         }
         return false;
     };
@@ -150,11 +141,7 @@ module.exports = function(RED) {
     // utan att invänta den förra, och alla vv*-variabler ovan är delade.
     let vvTickRunning = false;
 
-    let vvLastAiControl = false;
-    let vvManualHwMode = null;
-    let vvManualHwPeriod = null;
     let vvLastManualSchedule = false; // tidsstyrning VV – tidigare läge (on/off)
-    let vvManualHwPeriodSchedule = null; // cache för hw_period när tidsstyrning används
 
 
     // Dagens "sedda" timmar sparas numera till disk. Efter en omstart kan de vara
@@ -943,16 +930,6 @@ function hotwaterAiBuildGraph(store, hw) {
             // OBS: Node-RED kan spara true/false som strängar, så vi använder vvAiIsTrue().
             const priceControlEnabled = vvAiIsTrue(hw && hw.vv_ai_use_price_enable);
 
-            // Prisfönster: standard 7h, men kan styras av slider om vv_ai_price_window_enable = true.
-            const priceWindowOverrideEnabled = vvAiIsTrue(hw && hw.vv_ai_price_window_enable);
-            let priceWindowHours = 7;
-            if (priceWindowOverrideEnabled) {
-                let tmpHours = hw ? Number(hw.vv_ai_price_window_hours) : NaN;
-                if (Number.isFinite(tmpHours) && tmpHours > 0) {
-                    if (tmpHours > 24) tmpHours = 24;
-                    priceWindowHours = tmpHours;
-                }
-            }
 
             const profile = (store && Array.isArray(store.profile) && store.profile.length === 168)
                 ? store.profile
@@ -985,7 +962,6 @@ function hotwaterAiBuildGraph(store, hw) {
                 fromMin !== toMin;
 
             const scheduleGraphActive = scheduleEnabled && validWindow && Number.isFinite(scheduleMode);
-            // Elprisstyrning/prisfönster är redan beräknat ovan (priceControlEnabled + priceWindowHours).
             // Stopptemperaturer för Eco / Normal / Lux.
             // Primär källa: vv_stop_eco/normal/lux i hw-objektet (uppdateras av vvAiTick från hP['hw_stop_0/1/2']).
             let stopEco = NaN;
@@ -1208,17 +1184,6 @@ async function vvAiTick() {
             const aiControlEnabled = (hw.enable_vv_ai_control === true);
             const priceControlEnabled = vvAiIsTrue(hw.vv_ai_use_price_enable);
 
-            // Prisfönster: antingen standard 7h från backend,
-            // eller användarens eget värde om vv_ai_price_window_enable = true.
-            const priceWindowOverrideEnabled = vvAiIsTrue(hw.vv_ai_price_window_enable);
-            let priceWindowHours = 7;
-            if (priceWindowOverrideEnabled) {
-                let tmpHours = hw ? Number(hw.vv_ai_price_window_hours) : NaN;
-                if (Number.isFinite(tmpHours) && tmpHours > 0) {
-                    if (tmpHours > 24) tmpHours = 24;
-                    priceWindowHours = tmpHours;
-                }
-            }
 
             // Om varken VV-AI, tidsstyrning eller VV-AI-styrning är aktiverad
             // och vi inte har en pågående tidsstyrning att städa upp efter, gör vi ingenting.
@@ -1581,7 +1546,6 @@ async function vvAiTick() {
             try {
                 const hwPeriodKey = hP && hP['hw_period'];
                 const startHWKey = hP && hP['startHW'];
-                const hwModeKey = hP && hP['hw_mode'];
 
                 // --- Konfliktskydd: ömsesidigt uteslutande lägen ---
                 // - Tidsstyrning kräver VV-AI-styrning AV.
@@ -1600,10 +1564,8 @@ async function vvAiTick() {
 
                     const aiOn = (hwConf.enable_vv_ai_control === true);
                     const scheduleOn = (hwConf.vv_manual_schedule_enable === true);
-                    const learningOn = (hwConf.enable_vv_learning === true);
                     const hwRegOn = (hwConf.enable_hw_priority === true) || (hwConf.enable_autoluxury === true);
 
-                    const minTempOn = (hwConf.vv_ai_min_temp_enable === true);
 
                     if (scheduleOn && aiOn) {
                         // Om båda är PÅ: stäng av tidsstyrning (kräver att AI är AV)
@@ -1626,7 +1588,6 @@ async function vvAiTick() {
                 const hwEff = (conf && conf.hotwater) ? conf.hotwater : hw;
                 const scheduleEnabled = (hwEff && hwEff.vv_manual_schedule_enable === true);
                 const aiControlEnabled = (hwEff && hwEff.enable_vv_ai_control === true);
-                const learningEnabled = (hwEff && hwEff.enable_vv_learning === true);
                 const hwRegEnabled = (hwEff && ((hwEff.enable_hw_priority === true) || (hwEff.enable_autoluxury === true)));
 
                 const minTempEnabled = (aiControlEnabled && hwEff && hwEff.vv_ai_min_temp_enable === true);
@@ -1950,10 +1911,7 @@ async function vvAiTick() {
                 nibe.log(`VV-AI: fel vid hw_period/startHW-styrning: ${e}`, 'hotwater', 'error');
             }
 
-vvLastAiControl = (hw.enable_vv_ai_control === true);
 
-            if (Number.isFinite(bt7Now) && planTemp !== null) {
-            }
 
             store.meta.lastBt6 = bt6Now;
             store.meta.lastBt7 = bt7Now;
@@ -2070,7 +2028,6 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                             for( var o = 0; o < adjust[i].data.length; o++){
                                 out = out+adjust[i].data[o].data;
                             }
-                            out = out;
                             nibe.reqData(curveadjust).then(result => {
                                 let config = nibe.getConfig();
                                 if(config.home===undefined) {
@@ -2230,8 +2187,6 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                     if(getList[o].registers[regI].topic===undefined) getList[o].registers[regI].topic = arr[i].topic;
                                     if(regP===-1) {
                                         getList[o].registers[regI].plugin.push(plugin);
-                                    } else {
-
                                     }
                                 }
 
@@ -2257,8 +2212,6 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                         let regP = getList[regN].registers[regI].plugin.findIndex(regP => regP == plugin);
                                         if(regP===-1) {
                                             getList[regN].registers[regI].plugin.push(plugin);
-                                        } else {
-
                                         }
                                     }
                                     }
@@ -2270,9 +2223,6 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                         }).catch((err) => {
                             return reject(false)
                         })
-                    } else {
-                        //sendError('System',`System S${system.replace('s','')} ${text.sys_not_connected}`);
-                        //return reject(false);
                     }
                 }
                 if(newSystem===true) {
@@ -2312,8 +2262,6 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                         let regP = getList[regN].registers[regI].plugin.findIndex(regP => regP == plugin);
                                         if(regP===-1) {
                                             getList[regN].registers[regI].plugin.push(plugin);
-                                        } else {
-
                                         }
                                     }
                                     }
@@ -2346,8 +2294,6 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                         let regP = getList[regN].registers[regI].plugin.findIndex(regP => regP == plugin);
                                         if(regP===-1) {
                                             getList[regN].registers[regI].plugin.push(plugin);
-                                        } else {
-
                                         }
                                     }
                                     }
@@ -2401,8 +2347,6 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                 reqDataForPlugin(hP.bs1_flow,plugin,system,generation).then(data => {
                                     if(data.data<-3276) {
                                         return reject(false);
-                                    } else {
-
                                     }
                                 },(error => {
                                     return reject(false);
@@ -2614,7 +2558,6 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
     const runWeather = async (val) => {
         nibe.log(`Startar Prognosreglering`,'weather','debug');
         let timeNow = Date.now();
-        //var val = Object.assign({}, result);
         let config = nibe.getConfig();
         if(config.weather===undefined) {
             config.weather = {};
@@ -2879,7 +2822,6 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
     const indoorArray = [];
     const runIndoor = (data,array) => {
         var timeNow = Date.now();
-        //let data = Object.assign({}, result);
         let conf = nibe.getConfig();
         let inside_enable = data['inside_enable_'+data.system];
         let inside;
@@ -3535,7 +3477,6 @@ function findOptimalCombination(opportunities) {
 
     // Returnera kombinationen med högst total profit
     combinations.sort((a, b) => b.totalProfit - a.totalProfit);
-    //return combinations[0]?.trades || [];
     // KORRIGERING: Ersätter "combinations[0]?.trades" med en säkrare variant.
     return combinations.length > 0 ? combinations[0].trades : [];
 }
@@ -4293,8 +4234,6 @@ if (!level || (typeof level === 'string' && !['VERY_CHEAP','CHEAP','NORMAL','EXP
             config.price.hw_speed = 20;
             nibe.setConfig(config);
         }
-        var ts = new Date()
-        var hour = ts.getHours()
         var req = JSON.parse(request)
         if(req.name=="heat") {
                 get(options,request).then(async (data) => {
@@ -4362,7 +4301,6 @@ if (!level || (typeof level === 'string' && !['VERY_CHEAP','CHEAP','NORMAL','EXP
                             // NY, FÖRBÄTTRAD LOGGNING: Skriver ut det råa svaret
                             nibe.log(`Något blev fel vid JSON konvertering. Servern svarade: ${data}`, 'price', 'error');
 
-                            //nibe.log(`Något blev fel vid JSON konvertering`,'price','debug');
                             reject('No JSON response')
                         }
                     } else {
@@ -4432,13 +4370,9 @@ const lockFreq = (options) => {
             if(frequency > lock_freq_1_min.data) {
                 if(options.heat < 0) {
                     nibe.setData(hP['lock_freq_1_min'],frequency,(err,result) => {
-                        if(err) {
-
-                        } else {
+                        if(!err) {
                             nibe.setData(hP['lock_freq_1_activate'],"0",(err,result) => {
-                                if(err) {
-
-                                } else {
+                                if(!err) {
                                     nibe.setData(hP['lock_freq_1_activate'],"1")
                                 }
 
@@ -4585,51 +4519,34 @@ const blockAdditive = (options) => {
             data.hwON = hwON;
         }
         if(config.hotwater.enable_autoluxury===true) {
-            //if(hwON===undefined) {
-            //    sendError('Varmvattenreglering',`Virtuell RMU ej aktiverad.`);
-            //}
             let difference = Number(config.hotwater.diff);
             let diff_time = Number(config.hotwater.time);
             hwSavedTemp.unshift(bt6.data);
-            //console.log(`Saving BT6 value, ${bt6.data} °C`)
             if(hwSavedTemp.length>=diff_time) {
-                //console.log(JSON.stringify(hwSavedTemp));
                 if(hwSavedTemp.length>diff_time) {
                     hwSavedTemp.splice(diff_time,hwSavedTemp.length);
                 }
                 hwTriggerTemp = hwSavedTemp.pop()
                 hwTriggerTemp = hwTriggerTemp-difference;
             } else {
-                //console.log(JSON.stringify(hwSavedTemp));
                 hwTriggerTemp = hwSavedTemp[hwSavedTemp.length-1]
                 hwTriggerTemp = hwTriggerTemp-difference;
             }
             hwTriggerTemp = Number(hwTriggerTemp.toFixed(2));
-            //console.log(bt6.data+"<"+hwTriggerTemp)
             let hw_target_temp;
             if(hwON.raw_data!==4) {
-                //if((clock>=config.hotwater.priority_time_start1 && clock<config.hotwater.priority_time_stop1) || clock>=config.hotwater.priority_time_start2) {
                     if(bt6.data<=hwTriggerTemp) {
                         hwTargetValue = hwTriggerTemp+difference-5;
                         hwTargetValue = Number(hwTargetValue.toFixed(2));
                         hw_target_temp = hwTargetValue;
-                        //console.log(`Huge hotwater load. BT6 target value: ${hwTargetValue} °C, BT6 actual: ${bt6.data} °C`);
                         nibe.setData(hP['startHW'],4);
-                    } else {
-                        //console.log('Not huge hotwater load')
                     }
-                //}
 
             } else {
-                //console.log('Hotwater is already running luxury');
                 if(hwTargetValue!==undefined) {
-                    //console.log(`BT6 target value: ${hwTargetValue} °C, BT6 actual: ${bt6.data} °C`);
                     if(bt6.data>=hwTargetValue || bt6.data>=hwStopTemp.data) {
-                        //console.log(`BT6 target (${hwTargetValue} °C) reached, BT6 actual: ${bt6.data} °C`);
                         hwTargetValue = undefined;
                         nibe.setData(hP['startHW'],0);
-                    } else {
-                        //console.log('Target temperature not reached yet.')
                     }
                 }
             }
@@ -4652,19 +4569,11 @@ const blockAdditive = (options) => {
             hwStartTemp.timestamp = time;
             if(hwON.raw_data!==4) {
                 if(bt7.data<=hwStartTemp.data) {
-                    //console.log(`Start HW priority. BT7 target value: ${hwStopTemp.data} °C, BT7 actual: ${bt7.data} °C`);
                     nibe.setData(hP['startHW'],4);
-                } else {
-                    //console.log('Not starting HW priority')
                 }
             } else {
-                //console.log('Hotwater is already running luxury');
-                    //console.log(`BT7 target value: ${hwStopTemp.data} °C, BT7 actual: ${bt7.data} °C`);
                     if(bt7.data>=hwStopTemp.data && hwTargetValue===undefined) {
-                        //console.log(`BT7 target (${hwStopTemp.data} °C) reached, BT7 actual: ${bt7.data} °C`);
                         nibe.setData(hP['startHW'],0);
-                    } else {
-                        //console.log('Target temperature not reached yet.')
                     }
             }
             data.hwStartTemp = hwStartTemp;
@@ -4673,16 +4582,9 @@ const blockAdditive = (options) => {
         }
 
     }
-let fan_mode;
-let fan_mode_saved;
-let flow_set;
-let flow_saved;
-let fan_saved;
 let fan_filter_normal_eff;
 let fan_filter_low_eff;
 let filter_eff;
-let dMboost = false;
-let co2boost = false;
 let isRunFanExecuting = false;
 
 async function runFan() {
@@ -4812,426 +4714,6 @@ async function runFan() {
 }
 
 
-//##ORGINAL RUNFAN()
-async function runFanOrginal() {
-    async function checkBoost(data) {
-        const promise = new Promise(async function (resolve,reject) {
-        let config = nibe.getConfig();
-        if(config.fan.enable_dm_boost!==undefined && config.fan.enable_dm_boost===true && config.system.pump!=="F370" && config.system.pump!=="F470") {
-        data.dMadd = await getNibeData(hP['dMadd']).catch(console.log);
-        data.dMaddstart = await getNibeData(hP['dMaddstart']).catch(console.log)
-        data.dMstart = await getNibeData(hP['dMstart']).catch(console.log);
-        if(data.dMaddstart===undefined) {
-            data.dMaddstart = {}
-            data.dMadd = await getNibeData(hP['dMadd']).catch(console.log);
-            if(data.dMstart===undefined || data.dMadd===undefined) {
-                nibe.log(`Kunde inte läsa gradminutregister, hoppar över boostkontroll.`,'fan','error');
-                return reject(new Error('Kunde inte läsa gradminutregister'));
-            }
-            data.dMaddstart.data = data.dMstart.data-data.dMadd.data
-            data.dMaddstart.raw_data = data.dMstart.raw_data-data.dMadd.raw_data
-        }
-        data.dM = await getNibeData(hP['dM']).catch(console.log);
-            nibe.log(`Luftflödes boost vid låga gradminuter aktiverat.`,'fan','debug');
-            if(config.fan.dm_boost_start===undefined || config.fan.dm_boost_start=="" || config.fan.dm_boost_start===0) {
-                config.fan.dm_boost_start = 300;
-                nibe.setConfig(config);
-                nibe.log(`Inget standard värde för boosting, ställer 300 gradminuter som diff.`,'fan','debug');
-            }
-        let boost = (data.dMaddstart.data)+config.fan.dm_boost_start;
-        nibe.log(`Boostvärde: ${boost}`,'fan','debug');
-        if(boost>(data.dMstart.data-100)) {
-            reject(new Error(`Startvärde för boost ligger för nära gradminuter vid start av kompressor, ${boost}>${data.dMstart.data-100}`))
-        } else {
-            var lock_freq_1 = await getNibeData(hP['lock_freq_1_activate']).catch(console.log);
-            var lock_freq_2 = await getNibeData(hP['lock_freq_2_activate']).catch(console.log);
-
-            if(lock_freq_1===undefined || lock_freq_2===undefined) {
-                nibe.log(`Kunde inte läsa spärrbandsregister, hoppar över boostkontroll.`,'fan','error');
-                return reject(new Error('Kunde inte läsa spärrbandsregister'));
-            }
-            if(data.dM.data<boost && lock_freq_1.data===0 && lock_freq_2.data===0) {
-                nibe.log(`Gradminuter under gränsvärde för boost: ${boost}, Gradminuter: ${data.dM.data}`,'fan','debug');
-                if(data.alarm.raw_data!==183) {
-                    if(config.fan.dm_boost_value!==undefined && config.fan.dm_boost_value!=="" && config.fan.dm_boost_value!==0) {
-                        if(fan_mode!='dMboost') {
-                            fan_mode_saved = fan_mode
-                            fan_mode = 'dMboost'
-                            dMboost = true;
-                            fan_saved = data.fan_speed.raw_data;
-                            nibe.log(`Sparar fläkthastighet vid första upptäckt av forcering med gradminut boost, värde: ${fan_saved}%`,'fan','debug');
-                        }
-                        resolve(true)
-                    } else {
-                        reject(new Error('Inget boostvärde angivet'))
-                    }
-                } else {
-                    nibe.log(`Gradminutboost uppfylld, men avfrostning pågår.`,'fan','debug');
-                    reject();
-                }
-            } else if(lock_freq_1.data===1 && lock_freq_2.data===1) {
-                dMboost = false;
-                fan_mode = fan_mode_saved
-                nibe.log(`Blockering av hög kompressorfrekvens pågår via elprisreglering`,'fan','debug');
-                reject();
-            } else if(data.dM.data>(boost+50)) {
-                dMboost = false;
-                fan_mode = fan_mode_saved
-                nibe.log(`Gradminuter över gränsvärde för boost: ${boost+50}, Gradminuter: ${data.dM.data}`,'fan','debug');
-                reject();
-            } else {
-                if(fan_mode=='dMboost') {
-                    nibe.log(`Gradminuter under gränsvärde för boost, på väg mot stopp: ${boost}, Gradminuter: ${data.dM.data}`,'fan','debug');
-                    resolve(true)
-                } else {
-                    dMboost = false;
-                    fan_mode = fan_mode_saved
-                    nibe.log(`Gradminuter över gränsvärde för boost: ${boost}, Gradminuter: ${data.dM.data}`,'fan','debug');
-                    reject();
-                }
-            }
-        }
-    } else {
-        dMboost = false;
-        nibe.log(`Luftflödes boost vid låga gradminuter ej aktiverat.`,'fan','debug');
-        reject();
-    }
-    if(fan_mode!=="dMboost" && fan_mode_saved=="dMboost") {
-        if(data.alarm.raw_data!==183) {
-            if(fan_saved!==undefined) {
-                nibe.setData(hP.fan_speed,fan_saved);
-                data.fan_speed.raw_data = fan_saved;
-                nibe.log(`Återställer fläkthastighet (${fan_saved}%)`,'fan','debug');
-            }
-            if(config.fan[`speed_${fan_mode_saved}`]!==undefined) flow_set = config.fan[`speed_${fan_mode_saved}`];
-            nibe.log(`Ställer in ${fan_mode_saved} luftflöde: ${config.fan[`speed_${fan_mode_saved}`]} m3/h`,'fan','debug');
-        } else {
-            nibe.log(`Avfrostning pågår, avvaktar, sparad fläkthastighet (${fan_saved}%)`,'fan','debug');
-        }
-    }
-    });
-    return promise;
-    }
-    let config = nibe.getConfig();
-    var data = {};
-    var timeNow = Date.now();
-    if(config.fan===undefined) { config.fan = {}; nibe.setConfig(config); }
-    if(config.home.inside_sensors===undefined) { config.home.inside_sensors = []; nibe.setConfig(config); }
-    if(config.fan.enable!==true) {
-        // Function turned off, stopping.
-        return;
-    }
-    data.temp_fan_speed = await getNibeData(hP['fan_mode']).catch(console.log);
-    if(data.temp_fan_speed===undefined) {
-        nibe.log('Ingen data från fläktforceringsregister. Avbryter...','fan','error');
-        return;
-    }
-
-    data.co2Sensor;
-    data.fan_speed = await getNibeData(hP['fan_speed']).catch(console.log);
-    data.bs1_flow = await getNibeData(hP['bs1_flow']).catch(console.log);
-    // Check if bug with saving 0% resolves if(flow_set===undefined) flow_set = data.bs1_flow.raw_data;
-    data.alarm = await getNibeData(hP['alarm']).catch(console.log);
-    data.evaporator = await getNibeData(hP['evaporator']).catch(console.log);
-    data.cpr_set = await getNibeData(hP['cpr_set']).catch(console.log);
-
-    if(config.fan.enable_co2===true) {
-    if(config.fan.sensor===undefined || config.fan.sensor=="Ingen") {
-        nibe.log('CO2 givare inte vald.','fan','error');
-    } else {
-        let index = config.home.inside_sensors.findIndex(i => i.name == config.fan.sensor);
-        if(index!==-1) {
-            nibe.log('CO2 givare hittad.\n'+JSON.stringify(data.co2Sensor,null,2),'fan','debug');
-            data.co2Sensor = Object.assign({}, config.home.inside_sensors[index]);
-        } else {
-            nibe.log('CO2 givare inte hittad.','fan','debug');
-        }
-    }
-    if(data.co2Sensor!==undefined) {
-        if(data.co2Sensor.source=="mqtt") {
-            await nibe.getMQTTData(data.co2Sensor.register).then(atad => {
-                let result = Object.assign({}, atad);
-                nibe.log('Data från CO2 givare\n',result.data,'fan','debug');
-                let sensor_timeout;
-                if(config.home.sensor_timeout!==undefined && config.home.sensor_timeout!=="") {
-                    sensor_timeout = result.timestamp+(config.home.sensor_timeout*60000);
-                    nibe.log('Timeout vald för sensor, tid:'+config.home.sensor_timeout+" minuter",'fan','debug');
-                } else if(config.home.sensor_timeout===0) {
-                    sensor_timeout = timeNow;
-                    nibe.log('Timeout är avvaktiverad för sensor','fan','debug');
-                } else {
-                    sensor_timeout = result.timestamp+(60*60000);
-                    nibe.log('Timeout ej vald, sätter standard tid 60 minuter','fan','debug');
-                }
-                if(timeNow>sensor_timeout) {
-                    nibe.log(`CO2 givare ${data.co2Sensor.name} har inte uppdaterats. Ignorerar.`,'fan','error');
-                } else {
-                    nibe.log(`CO2 givare ${data.co2Sensor.name} värde:${result.data}`,'fan','debug');
-                    data.co2Sensor.data = result;
-                    data.co2Sensor.data.timestamp = timeNow;
-                    saveDataGraph('fan_co2Sensor',timeNow,data.co2Sensor.data.data,true)
-                }
-
-            },(error => {
-                nibe.log(`CO2 givare ${data.co2Sensor.name} har inga värden än.`,'fan','error');
-            }));
-        } else if(data.co2Sensor.source=="tibber") {
-            console.log('Tibber Data request');
-        }
-    }
-}
-    // Check if co2 wants boosting
-        if(config.fan.enable_co2===true && config.fan.enable_high) {
-            if(data.alarm.raw_data!==183) {
-                nibe.log(`CO2 boosting aktiverad`,'fan','debug');
-                if(config.fan.high_co2_limit===undefined || config.fan.high_co2_limit=="" || config.fan.high_co2_limit===0) {
-                    nibe.log(`Inget standard värde för boosting, ställer in 1000 ppm`,'fan','debug');
-                    config.fan.high_co2_limit = 1000;
-                    nibe.setConfig(config);
-                }
-                data.high_co2_limit = config.fan.high_co2_limit;
-                saveDataGraph('fan_high_co2_limit',timeNow,config.fan.high_co2_limit,true);
-                if(data.co2Sensor!==undefined && data.co2Sensor.data!==undefined) {
-                    data.co2Sensor.data.data = Number(data.co2Sensor.data.data);
-                    if(data.co2Sensor.data.data>config.fan.high_co2_limit) {
-                        nibe.log(`CO2 givares värde (${data.co2Sensor.data.data}) över gränsvärde ${config.fan.high_co2_limit}`,'fan','debug');
-                        if(config.fan.speed_high!==undefined && config.fan.speed_high!="" && config.fan.speed_high!==0) {
-                            if(fan_mode!='co2boost') {
-                                fan_mode_saved = fan_mode
-                                fan_mode = 'co2boost'
-                                co2boost = true;
-                            }
-                            flow_set = config.fan.speed_high;
-                            if(fan_mode!=="co2boost") {
-                                fan_saved = data.fan_speed.raw_data;
-                                nibe.log(`Sparar fläkthastighet vid första upptäckt av forcering med CO2, värde: ${fan_saved}%`,'fan','debug');
-                            }
-                            nibe.log(`Ställer in högt luftflöde: ${config.fan.speed_high} m3/h`,'fan','debug');
-                            dMboost = false;
-                        } else {
-                            nibe.log(`Inget luftflöde valt för boosting.`,'fan','error');
-                        }
-                    } else {
-                        nibe.log(`CO2 givares värde (${data.co2Sensor.data.data}) under gränsvärde ${config.fan.high_co2_limit}`,'fan','debug');
-
-                        if(data.alarm.raw_data!==183) {
-                            if(fan_saved!==undefined) {
-                                nibe.setData(hP.fan_speed,fan_saved);
-                                data.fan_speed.raw_data = fan_saved;
-                                nibe.log(`Återställer fläkthastighet (${fan_saved}%)`,'fan','debug');
-                            }
-                            if(config.fan[`speed_${fan_mode_saved}`]!==undefined) flow_set = config.fan[`speed_${fan_mode_saved}`];
-                            fan_mode = fan_mode_saved;
-                            nibe.log(`Ställer in ${fan_mode_saved} luftflöde: ${config.fan[`speed_${fan_mode_saved}`]} m3/h`,'fan','debug');
-                        } else {
-                            nibe.log(`Avfrostning pågår, avvaktar, sparad fläkthastighet (${fan_saved}%)`,'fan','debug');
-                        }
-                    }
-                } else {
-                    nibe.log(`Inget värde på CO2 givare`,'fan','error');
-                }
-            } else {
-                nibe.log(`Avfrostning pågår. Avvaktar.`,'fan','debug');
-            }
-    } else {
-        nibe.log(`CO2 boosting ej aktiverad.`,'fan','debug');
-    }
-    if(fan_mode!=="co2boost") {
-        co2boost = false;
-        await checkBoost(data).then(result => {
-            nibe.log(`Villkor för gradminutboosting uppfyllda.`,'fan','debug');
-            flow_set = config.fan.dm_boost_value;
-
-        },(err => {
-            if(err) {
-                //nibe.log(err,'fan','error');
-            } else {
-                if(config.fan.enable_low===true && data.cpr_set.raw_data<config.fan.low_cpr_freq) {
-                    nibe.log(`Kompressorfrekvens under gränsvärde`,'fan','debug');
-                    if(data.alarm.raw_data!==183) {
-                        if(config.fan.enable_co2===true) {
-                            nibe.log(`CO2 styrning aktiverad.`,'fan','debug');
-                            if(data.co2Sensor!==undefined && data.co2Sensor.data!==undefined) {
-                                nibe.log(`Värde finns från CO2 givare`,'fan','debug');
-                                data.co2Sensor.data.data = Number(data.co2Sensor.data.data);
-                                if(config.fan.low_co2_limit===undefined || config.fan.low_co2_limit=="" || config.fan.low_co2_limit===0) {
-                                    config.fan.low_co2_limit = 800;
-                                    nibe.setConfig(config);
-                                    nibe.log(`Inget standard värde för CO2 valt, sätter 800 ppm.`,'fan','debug');
-                                }
-                                data.low_co2_limit = config.fan.low_co2_limit;
-                                saveDataGraph('fan_low_co2_limit',timeNow,config.fan.low_co2_limit,true);
-                                if(data.co2Sensor.data.data<config.fan.low_co2_limit) {
-                                    if(fan_mode=="low") {
-                                        flow_set = config.fan.speed_low;
-                                        nibe.log(`CO2 givares värde (${data.co2Sensor.data.data}) ppm under gränsvärde för att kunna forcera låg fläkthastighet (${config.fan.low_co2_limit} ppm)`,'fan','debug');
-                                    } else {
-                                        if(fan_mode==="normal") {
-                                            fan_saved = data.fan_speed.raw_data;
-                                            nibe.log(`Sparar fläkthastighet vid första upptäckt av låg frekvens med CO2, värde: ${fan_saved}%`,'fan','debug');
-                                        }
-                                        fan_mode = "low";
-                                    }
-                                } else {
-                                    if(fan_mode=="normal") {
-                                        flow_set = config.fan.speed_normal;
-                                        nibe.log(`CO2 givares värde (${data.co2Sensor.data.data}) ppm över gränsvärde för att kunna forcera låg fläkthastighet (${config.fan.low_co2_limit} ppm)`,'fan','debug');
-                                    } else {
-                                        fan_mode = "normal";
-                                        nibe.log(`CO2 givares värde (${data.co2Sensor.data.data}) ppm över gränsvärde men avvaktar en cykel (${config.fan.low_co2_limit} ppm`,'fan','debug');
-                                    }
-                                }
-                            } else {
-                                    nibe.log(`Inget värde på CO2 givare, ställer in normalt luftflöde: ${config.fan.speed_normal} m3/h`,'fan','debug');
-                                    flow_set = config.fan.speed_normal;
-                                    fan_mode = "normal";
-                            }
-                        } else {
-                            nibe.log(`CO2 styrning ej aktiverad`,'fan','debug');
-                            if(config.fan.speed_low!==undefined && config.fan.speed_low!=="" && config.fan.speed_low!==0) {
-                                if(fan_mode=="low") {
-                                    flow_set = config.fan.speed_low;
-                                    nibe.log(`Ställer in lågt luftflöde: ${config.fan.speed_low} m3/h`,'fan','debug');
-                                } else {
-                                    if(fan_mode==="normal") {
-                                        fan_saved = data.fan_speed.raw_data;
-                                        nibe.log(`Sparar fläkthastighet vid första upptäckt av låg frekvens, värde: ${fan_saved}%`,'fan','debug');
-                                    }
-                                    fan_mode = "low";
-                                }
-                            } else {
-                                nibe.log(`Inget värde på lågt luftflöde`,'fan','debug');
-                            }
-                        }
-                    } else {
-                        nibe.log(`Avfrostning pågår, avvaktar.`,'fan','debug');
-                    }
-                } else {
-                        if(fan_mode=="low") {
-                            nibe.log(`Kompressorfrekvens över gränsvärde och föregående läge var låg frekvens.`,'fan','debug');
-                            if(data.alarm.raw_data!==183) {
-                                if(fan_saved!==undefined) {
-                                    nibe.setData(hP.fan_speed,fan_saved);
-                                    data.fan_speed.raw_data = fan_saved;
-                                    nibe.log(`Återställer fläkthastighet (${fan_saved}%)`,'fan','debug');
-                                }
-                                flow_set = config.fan.speed_normal;
-                                fan_mode = "normal";
-                                nibe.log(`Ställer in normalt luftflöde: ${config.fan.speed_normal} m3/h`,'fan','debug');
-                            } else {
-                                nibe.log(`Avfrostning pågår, avvaktar, sparad fläkthastighet (${fan_saved}%)`,'fan','debug');
-                            }
-                        } else {
-                            nibe.log(`Villkor uppfyllda för normalt luftflöde: ${config.fan.speed_normal} m3/h`,'fan','debug');
-                            if(data.alarm.raw_data!==183) {
-                                flow_set = config.fan.speed_normal;
-                                fan_mode = "normal";
-                                nibe.log(`Ställer in normalt luftflöde: ${config.fan.speed_normal} m3/h`,'fan','debug');
-                            } else {
-                                nibe.log(`Avfrostning pågår, avvaktar...`,'fan','debug');
-                            }
-                        }
-                }
-            }
-        }));
-    }
-
-
-    // Start regulating only if not defrosting and vented air is above freezing temperatures.
-    if((data.alarm.raw_data!==183 && data.evaporator.raw_data>0 && data.temp_fan_speed!==undefined && data.temp_fan_speed.raw_data===0)) {
-        if(flow_set<30) {
-            nibe.log(`För lågt luftflöde inställt, avbryter.`,'fan','error');
-            return;
-        }
-        if(flow_set===undefined) {
-            nibe.log(`Inget börvärde på flöde, avvaktar...`,'fan','error');
-            return;
-        }
-        nibe.log(`Villkor uppfyllda för reglering av flöde.`,'fan','debug');
-        nibe.log(`Flowset: ${flow_set}, Flöde: ${data.bs1_flow.raw_data}, Flowsaved: ${flow_saved}`,'fan','debug');
-        if(fan_mode!=="dMboost" && fan_mode!=="co2boost" && fan_mode!=="low" && data.bs1_flow.raw_data>(flow_set+25) && (flow_saved===undefined || data.bs1_flow.raw_data>flow_saved+25)) {
-            nibe.log(`Luftflöde långt över börvärde: ${flow_set}, Flöde: ${data.bs1_flow.raw_data} m3/h, Forcering pågår`,'fan','debug');
-        } else if(data.bs1_flow.raw_data>(flow_set+20)) {
-            if(data.fan_speed.raw_data-5>10) {
-                nibe.log(`Luftflöde långt över gränsvärde: ${flow_set+20}, Flöde: ${data.bs1_flow.raw_data} m3/h, -5%`,'fan','debug');
-                nibe.setData(hP.fan_speed,(data.fan_speed.raw_data-5));
-            } else if(data.fan_speed.raw_data>10) {
-                nibe.log(`Luftflöde långt över gränsvärde: ${flow_set+20}, Flöde: ${data.bs1_flow.raw_data} m3/h, -1%`,'fan','debug');
-                nibe.setData(hP.fan_speed,(data.fan_speed.raw_data-1));
-            }
-        } else if(data.bs1_flow.raw_data>(flow_set+10)) {
-            nibe.log(`Luftflöde över gränsvärde: ${flow_set+10}, Flöde: ${data.bs1_flow.raw_data} m3/h, -1%`,'fan','debug');
-            if(data.fan_speed.raw_data>0) nibe.setData(hP.fan_speed,(data.fan_speed.raw_data-1));
-        } else if(data.bs1_flow.raw_data<(flow_set-20)) {
-            if(data.fan_speed.raw_data+5<100) {
-                nibe.log(`Luftflöde långt under gränsvärde: ${flow_set+20}, Flöde: ${data.bs1_flow.raw_data} m3/h, +5%`,'fan','debug');
-                nibe.setData(hP.fan_speed,(data.fan_speed.raw_data+5));
-            } else if(data.fan_speed.raw_data<100) {
-                nibe.log(`Luftflöde långt under gränsvärde: ${flow_set+20}, Flöde: ${data.bs1_flow.raw_data} m3/h, +1%`,'fan','debug');
-                nibe.setData(hP.fan_speed,(data.fan_speed.raw_data+1));
-            }
-        } else if(data.bs1_flow.raw_data<(flow_set-10)) {
-            nibe.log(`Luftflöde under gränsvärde: ${flow_set+10}, Flöde: ${data.bs1_flow.raw_data} m3/h, +1%`,'fan','debug');
-            if(data.fan_speed.raw_data<100) nibe.setData(hP.fan_speed,(data.fan_speed.raw_data+1));
-        } else {
-            nibe.log(`Luftflöde stabilt (${data.bs1_flow.raw_data} m3/h)`,'fan','debug');
-            dMboost = false;
-            co2boost = false;
-            flow_saved = data.bs1_flow.raw_data;
-            if(config.fan.enable_filter===true) {
-                nibe.log(`Filterkontroll är aktiverad`,'fan','debug');
-            // Value is stable, save fan speeds if calibration is active.
-            if(fan_mode=="low") {
-                if(config.fan.filter_value_low===-1) {
-                    config.fan.filter_value_low = data.fan_speed.raw_data;
-                    nibe.setConfig(config);
-                } else {
-                    if(config.fan.filter_value_low!==undefined && config.fan.filter_value_low!="") {
-                        let saved = config.fan.filter_value_low;
-                        fan_filter_low_eff = Number(((saved/data.fan_speed.raw_data)*100).toFixed(0));
-                    }
-                }
-            } else if(fan_mode=="normal") {
-                if(config.fan.filter_value_normal===-1) {
-                    config.fan.filter_value_normal = data.fan_speed.raw_data;
-                    nibe.setConfig(config);
-                } else {
-                    if(config.fan.filter_value_normal!==undefined && config.fan.filter_value_normal!="") {
-                        let saved = config.fan.filter_value_normal;
-                        fan_filter_normal_eff = Number(((saved/data.fan_speed.raw_data)*100).toFixed(0));
-                    }
-
-                }
-            }
-            fan_mode = undefined;
-            if(fan_filter_low_eff!==undefined && fan_filter_normal_eff===undefined) {
-                filter_eff = Number((fan_filter_low_eff).toFixed(0));
-                if(filter_eff>100) filter_eff = 100;
-            } else if(fan_filter_low_eff===undefined && fan_filter_normal_eff!==undefined) {
-                filter_eff = Number((fan_filter_normal_eff).toFixed(0));
-                if(filter_eff>100) filter_eff = 100;
-            } else if(fan_filter_low_eff!==undefined && fan_filter_normal_eff!==undefined) {
-                filter_eff = Number(((fan_filter_low_eff+fan_filter_normal_eff)/2).toFixed(0));
-                if(filter_eff>100) filter_eff = 100;
-            } else {
-
-            }
-            }
-        }
-    } else {
-        if(co2boost===false) nibe.log(`Villkor för reglering ej uppfyllt, CO2 boost inte över gränsvärde`,'fan','debug');
-        if(dMboost===false) nibe.log(`Villkor för reglering ej uppfyllt, Gradminutboost inte under gränsvärde`,'fan','debug');
-        if(data.alarm.raw_data===183) nibe.log(`Villkor för reglering ej uppfyllt, avfrostning pågår.`,'fan','debug');
-        if(data.evaporator.raw_data<0) nibe.log(`Villkor för reglering ej uppfyllt, förångaren för kall (${data.evaporator.raw_data})`,'fan','debug');
-        if(data.temp_fan_speed!==undefined && data.temp_fan_speed.raw_data!==0) nibe.log(`Villkor för reglering ej uppfyllt, Tillfällig fläktforcering pågår. värde: ${data.temp_fan_speed.raw_data}`,'fan','debug');
-    }
-    data.cpr_act = await getNibeData(hP['cpr_act']).catch(console.log);
-    saveDataGraph('fan_setpoint',timeNow,flow_set,true);
-    saveDataGraph('filter_eff',timeNow,filter_eff,true);
-    data.filter_eff = filter_eff;
-    data.setpoint = flow_set;
-    nibeData.emit('pluginFan',data);
-}
 async function runRMU(result,array) {
     let config = nibe.getConfig();
     var data = Object.assign({}, result);
@@ -5254,8 +4736,6 @@ async function runRMU(result,array) {
             }
             data.rmuSensor = inside;
             nibeData.emit('pluginRMU',data);
-        } else {
-
         }
     }
 }
@@ -5341,7 +4821,6 @@ function getSystems() {
     return systems;
 }
 let defrostTimer = 60000;
-let defrosting;
 let cpr_running;
 let defrost_saved;
 let runTime;
@@ -5506,11 +4985,6 @@ const checkTranslation = (node) => {
             if(config.mqtt===undefined) config.mqtt = {};
             nibe.handleMQTT(config.mqtt.enable,config.mqtt.host,config.mqtt.port,config.mqtt.user,config.mqtt.pass, (err,result) => {
                 if(err) this.warn(err);
-                if(result===true) {
-                    //console.log('MQTT broker is connected')
-                } else {
-                    //console.log('MQTT broker is disconnected')
-                }
             })
         }
 
@@ -5564,8 +5038,6 @@ const checkTranslation = (node) => {
                                     }
                                 }
 
-                                //if(config.system.pump=="F750") hP.supply_s1 = "40047";
-                                //if(config.system.pump=="F1345") hP.supply_s1 = "40071";
                                 sendError('Kärnan',`Nibe ${config.system.pump} är ansluten`);
                                 console.log('Core is connected');
                                 updateData(true);
@@ -5623,7 +5095,6 @@ const checkTranslation = (node) => {
             if(config.system===undefined || config.system.save_graph!==true) return;
             if(result===undefined) return;
             savedGraph = result;
-            //this.context().global.set(`graphs`, result);
         },(err => {
 
         }));
@@ -5632,7 +5103,6 @@ const checkTranslation = (node) => {
             nibe.setConfig(req.body.config);
             handleCore(req.body.config);
             nibeData.emit(req.params.id,req.body.data);
-            //handleMQTT(req.body);
         });
         RED.httpAdmin.get('/config', function(req, res) {
             res.json(nibe.getConfig());
@@ -5698,7 +5168,6 @@ const checkTranslation = (node) => {
 
         var hourly = cron.schedule('0 * * * *', () => {
             if(nibe.core!==undefined && nibe.core.connected!==undefined && nibe.core.connected===true) {
-            //let graph = this.context().global.get(`graphs`);
             saveGraph().catch(err => {
 
             });
@@ -5723,7 +5192,6 @@ const checkTranslation = (node) => {
         nibeData.emit('data',data);
         savedData[data.register] = data;
         saveDataGraph(data.register,Date.now(),data.raw_data)
-        //console.log(`${data.register}, ${data.titel}: ${data.data} ${data.unit}`)
     })
     nibe.data.on('mqttData',data => {
         saveDataGraph(data.register,data.timestamp,data.raw_data,true)

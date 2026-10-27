@@ -143,7 +143,6 @@ module.exports = function (RED) {
 
             context.set("vv_profile", profile, storeName);
 
-            const avg = (typeof bucket.avg === "number" && !isNaN(bucket.avg)) ? bucket.avg : bt7;
 
             const profileAvg = profile.map(b => (b && typeof b.avg === "number" ? b.avg : null));
 

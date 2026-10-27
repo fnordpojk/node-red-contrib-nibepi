@@ -34,7 +34,6 @@ module.exports = function(RED) {
                 let index = conf.home.inside_sensors.findIndex(i => i.name == conf.rmu['sensor_'+config.system]);
                 if(index!==-1) {
                     var insideSensor = Object.assign({}, conf.home.inside_sensors[index]);
-                    //let insideSensor = conf.home.inside_sensors[index];
                     arr.push(insideSensor);
                 }
             }
