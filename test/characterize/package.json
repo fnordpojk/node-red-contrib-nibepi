@@ -1,0 +1,8 @@
+{
+  "name": "nibepi-characterize",
+  "private": true,
+  "description": "Characterization traces for node-red-contrib-nibepi",
+  "devDependencies": {
+    "suncalc": "^2.0.2"
+  }
+}
