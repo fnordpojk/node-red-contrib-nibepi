@@ -1,10 +1,5 @@
 {
   "dash": {
-    "readonly": {
-      "SE": "<b>Read-only</b><br><i>NibePi kör med ett läsbart filsystem</i>",
-      "EN": "<b>Read-only</b><br><i>NibePi runs on a read-only filesystem</i>",
-      "DE": "<b>Schreibschutz</b><br><i>NibePi läuft auf einem schreibgeschützen Dateisystem</i>"
-    },
     "language": {
       "SE": "<b>Språk</b>",
       "EN": "<b>Language</b>",
@@ -274,26 +269,6 @@
       "EN": "<b>RMU-40 S3</b>",
       "DE": "<b>RMU-40 S3</b>"
     },
-    "samba_stop": {
-      "SE": "<b>Stoppa Samba</b>",
-      "EN": "<b>Stop Samba</b>",
-      "DE": "<b>Samba Stoppen</b>"
-    },
-    "samba_start": {
-      "SE": "<b>Starta Samba</b>",
-      "EN": "<b>Start Samba</b>",
-      "DE": "<b>Samba starten</b>"
-    },
-    "nodered_restart": {
-      "SE": "<b>Starta om Node-RED</b>",
-      "EN": "<b>Restart Node-RED</b>",
-      "DE": "<b>Node-RED neu starten</b>"
-    },
-    "nodered_restart_info": {
-      "SE": "Startar om Node-RED",
-      "EN": "Trigger a restart of Node-RED.",
-      "DE": "Neustart von Node-RED auslösen."
-    },
     "hw_restart": {
       "SE": "<b>Starta om hårdvaran</b>",
       "EN": "<b>Restart NibePi hardware</b>",
@@ -343,26 +318,6 @@
       "SE": "<b>Lösenord</b>",
       "EN": "<b>Password</b>",
       "DE": "<b>Passwort</b>"
-    },
-    "plejd_enable": {
-      "SE": "<b>Aktivera Plejd Gateway</b>",
-      "EN": "<b>Enable Plejd Gateway</b>",
-      "DE": "<b>Plejd-Gateway aktivieren</b>"
-    },
-    "plejd_disable": {
-      "SE": "<b>Inaktivera Plejd Gateway</b>",
-      "EN": "<b>Disable Plejd Gateway</b>",
-      "DE": "<b>Plejd-Gateway deaktivieren</b>"
-    },
-    "plejd_restart": {
-      "SE": "<b>Starta om Plejd Gateway</b>",
-      "EN": "<b>Restart Plejd Gateway</b>",
-      "DE": "<b>Starten Sie das Plejd-Gateway neu</b>"
-    },
-    "plejd_restart_info": {
-      "SE": "Startar om Plejd Gateway",
-      "EN": "Restarting the Plejd Gateway",
-      "DE": "Neustart des Plejd-Gateways"
     },
     "lat": {
       "SE": "<b>Latitud</b>",
