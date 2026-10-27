@@ -2163,7 +2163,7 @@ async function vvAiTick() {
             clearList(plugin,system).then(result => {
                 var newSystem = true;
 
-                for( var i = 0; i < arr.length; i++){
+                for( let i = 0; i < arr.length; i++){
                     if(arr[i].register===undefined) {
                         arr[i].register = hP[arr[i].topic];
                     }
@@ -2200,7 +2200,7 @@ async function vvAiTick() {
                             if(data!==undefined) {
                                 let regN = getList.findIndex(regN => regN.system == 's1');
                                 if(regN!==-1) {
-                                for( var i = 0; i < arr.length; i=i+1){
+                                for( let i = 0; i < arr.length; i=i+1){
                                     let regI = getList[regN].registers.findIndex(regI => regI.register == arr[i].register);
                                     if(regI===-1) {
                                         let newArr = arr[i];
@@ -2243,14 +2243,14 @@ async function vvAiTick() {
                                             let regN = getList.findIndex(regN => regN.system == system);
                                 if(regN===-1) {
                                     getList.push({system:system,registers:[]});
-                                    for( var i = 0; i < arr.length; i=i+1){
+                                    for( let i = 0; i < arr.length; i=i+1){
                                         let regI = getList.findIndex(regI => regI.system == system);
                                         let newArr = arr[i];
                                         newArr.plugin = [plugin];
                                         getList[regI].registers.push(newArr);
                                     }
                                 } else {
-                                    for( var i = 0; i < arr.length; i=i+1){
+                                    for( let i = 0; i < arr.length; i=i+1){
                                     let regI = getList[regN].registers.findIndex(regI => regI.register == arr[i].register);
                                     if(regI===-1) {
                                         let newArr = arr[i];
@@ -2275,14 +2275,14 @@ async function vvAiTick() {
                                 let regN = getList.findIndex(regN => regN.system == system);
                                 if(regN===-1) {
                                     getList.push({system:system,registers:[]});
-                                    for( var i = 0; i < arr.length; i=i+1){
+                                    for( let i = 0; i < arr.length; i=i+1){
                                         let regI = getList.findIndex(regI => regI.system == system);
                                         let newArr = arr[i];
                                         newArr.plugin = [plugin];
                                         getList[regI].registers.push(newArr);
                                     }
                                 } else {
-                                    for( var i = 0; i < arr.length; i=i+1){
+                                    for( let i = 0; i < arr.length; i=i+1){
                                     let regI = getList[regN].registers.findIndex(regI => regI.register == arr[i].register);
                                     if(regI===-1) {
                                         let newArr = arr[i];
@@ -4746,9 +4746,7 @@ async function getNibeData(register) {
 });
 return promise;
 }
-isObject = function(a) {
-    return (!!a) && (a.constructor === Object);
-};
+const isObject = (a) => (!!a) && (a.constructor === Object);
 function saveDataGraph(name,ts,data,save=false) {
     function isValid(data) {
         if(data!==undefined) {
