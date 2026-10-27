@@ -105,29 +105,22 @@ const checkTranslation = (node) => {
 }
     console.log(ctx.text.starting)
 
-    // Features in lib/, created in dependency order. They share through ctx.
-    Object.assign(ctx, { nibe });
-    const { optimizeElectricityTrading, priceLevelsFromTrades } = Object.assign(ctx, require('./lib/price-trading')(ctx));
+    // The features live in lib/. Each takes what it needs from ctx and adds what it
+    // offers, so they are created in dependency order: shared first, plugins last.
     Object.assign(ctx, { nibe, nibeData });
-    const { curveAdjust, getNibeData, getSavedData, getSavedGraph, getSystems, gethP, indoorOffset, minuteUpdate, priceOffset, reportPluginError, runSafely, saveDataGraph, savedData, sendError, systems, tenMinuteUpdate, timer, weatherOffset } = Object.assign(ctx, require('./lib/shared')(ctx));
-    Object.assign(ctx, { getNibeData, nibe, nibeData });
-    const { vvAiTick } = Object.assign(ctx, require('./lib/vvai')(ctx));
-    Object.assign(ctx, { curveAdjust, getNibeData, nibe, nibeData, optimizeElectricityTrading, priceLevelsFromTrades, priceOffset, reportPluginError, sendError });
-    const { getCloudData, runPrice } = Object.assign(ctx, require('./lib/price')(ctx));
-    Object.assign(ctx, { curveAdjust, getNibeData, nibe, nibeData, saveDataGraph, savedData, weatherOffset });
-    const { runWeather, suncalc } = Object.assign(ctx, require('./lib/weather')(ctx));
-    Object.assign(ctx, { curveAdjust, indoorOffset, nibe, nibeData, saveDataGraph, sendError });
-    const { runIndoor } = Object.assign(ctx, require('./lib/indoor')(ctx));
-    Object.assign(ctx, { getNibeData, nibe, nibeData, saveDataGraph });
-    const { hotwaterPlugin } = Object.assign(ctx, require('./lib/hotwater')(ctx));
-    Object.assign(ctx, { getNibeData, nibe, nibeData, saveDataGraph });
-    const { runFan } = Object.assign(ctx, require('./lib/fan')(ctx));
-    Object.assign(ctx, { getNibeData, nibe, saveDataGraph, timer });
-    const { runDiagnostic } = Object.assign(ctx, require('./lib/diagnostic')(ctx));
-    Object.assign(ctx, { nibe, nibeData, sendError });
-    const { runRMU } = Object.assign(ctx, require('./lib/rmu')(ctx));
-    Object.assign(ctx, { getNibeData, indoorOffset, nibe, nibeData, priceOffset, reportPluginError, runIndoor, runPrice, runRMU, runSafely, runWeather, sendError, systems, weatherOffset });
-    const { initiatePlugin, pluginRetryTimers, updateData } = Object.assign(ctx, require('./lib/plugins')(ctx));
+    Object.assign(ctx, require('./lib/price-trading')(ctx));
+    Object.assign(ctx, require('./lib/shared')(ctx));
+    Object.assign(ctx, require('./lib/vvai')(ctx));
+    Object.assign(ctx, require('./lib/price')(ctx));
+    Object.assign(ctx, require('./lib/weather')(ctx));
+    Object.assign(ctx, require('./lib/indoor')(ctx));
+    Object.assign(ctx, require('./lib/hotwater')(ctx));
+    Object.assign(ctx, require('./lib/fan')(ctx));
+    Object.assign(ctx, require('./lib/diagnostic')(ctx));
+    Object.assign(ctx, require('./lib/rmu')(ctx));
+    Object.assign(ctx, require('./lib/plugins')(ctx));
+    const { curveAdjust, getCloudData, getNibeData, getSavedData, getSavedGraph, getSystems, gethP, hotwaterPlugin, initiatePlugin, minuteUpdate, pluginRetryTimers, runDiagnostic, runFan, saveDataGraph, savedData, sendError, suncalc, tenMinuteUpdate, timer, updateData, vvAiTick } = ctx;
+
     function nibeConfig(n) {
         RED.nodes.createNode(this,n);
         var cron = require('node-cron');
