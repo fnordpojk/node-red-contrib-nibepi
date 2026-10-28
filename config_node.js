@@ -317,6 +317,8 @@ const checkTranslation = (node) => {
 
         })
         var threeminutes = cron.schedule('*/3 * * * *', () => {
+            // On the full hour the hourly job runs the same, and the forecast with it.
+            if(new Date().getMinutes()===0) return;
             if(nibe.core!==undefined && nibe.core.connected!==undefined && nibe.core.connected===true) {
                 updateData();
             }
