@@ -35,7 +35,7 @@
   "scripts": {
     "test": "node test/characterize/run.js check"
   },
-  "version": "2.0.0",
+  "version": "2.0.1",
   "engines": {
     "node": ">=20"
   }
