@@ -910,9 +910,9 @@
       "DE": "<i>Hinweis: Um die Preisniveaus von NibeUplink zu verwenden, muss SmartPrice im Menü 4.1.6 Smart Price Adaption der Wärmepumpe aktiviert werden.<br>Alle Einstellungen müssen jedoch auf Standardwerte zurückgesetzt werden, damit NibePi das System steuern kann.</i>"
     },
     "price_sensor_info": {
-      "SE": "Begränsa elprisregleringens påverkan med hjälp av en rumsgivare.<br>Ställ in en differens för den lägsta temperaturen som tillåts vid högt elpris för reglering mot ditt rumsbörvärde.",
-      "EN": "Limit the influence of the price adaption by means of a room temperature sensor.<br>Set the lowest temperature allowed at high electricity prices.",
-      "DE": "Begrenzung der Auswirkung des Strompreises<br>Definiere eine Temperaturdifferenz die auch bei hohem Strompreis nicht unterschritten werden darf."
+      "SE": "Begränsa elprisregleringens påverkan med hjälp av en rumsgivare.<br>Ställ in en differens för den lägsta temperaturen som tillåts vid högt elpris för reglering mot ditt rumsbörvärde.<br>Väljer du ”Ingen” används värmepumpens egen rumsgivare (BT50). Är ingen BT50 ansluten sänks inte värmen vid högt elpris.",
+      "EN": "Limit the influence of the price adaption by means of a room temperature sensor.<br>Set the lowest temperature allowed at high electricity prices.<br>With “Ingen” (none) selected, the heat pump's own room sensor (BT50) is used. Without a BT50 connected, the heat is not lowered at high prices.",
+      "DE": "Begrenzung der Auswirkung des Strompreises<br>Definiere eine Temperaturdifferenz die auch bei hohem Strompreis nicht unterschritten werden darf.<br>Bei „Ingen“ (keiner) wird der eigene Raumfühler der Wärmepumpe (BT50) verwendet. Ist kein BT50 angeschlossen, wird die Heizung bei hohem Strompreis nicht abgesenkt."
     },
     "price_s1_info": {
       "SE": "<p><b>Elprisreglering S1</b></p><br>Välj hur mycket kurvjusteringen ska justeras vid olika prisnivåer.<br>Reglering mot rumsgivare rekommenderas starkt, ibland förekommer det längre perioder av samma låga eller höga pris",

@@ -170,6 +170,9 @@ function profileStore() {
 module.exports = [
     scenario('price-tibber', { minutes: 480, nodes: nodesFor('nibe-price', 'nibe-graph'),
         configure: (c) => { c.price = priceSettings('tibber'); } }),
+    // Lowest indoor temperature one degree below the setpoint, no sensor chosen ("Ingen").
+    scenario('price-tibber-ingen', { minutes: 480, nodes: nodesFor('nibe-price'),
+        configure: (c) => { c.price = Object.assign(priceSettings('tibber'), { temp_low_s1: -1 }); } }),
     scenario('price-tibber-own', { minutes: 480, nodes: nodesFor('nibe-price'),
         configure: (c) => { c.price = Object.assign(priceSettings('tibber'), { enable_own_setting: true, verycheap: 70, veryexpensive: 150 }); } }),
     scenario('price-elprisetjustnu', { minutes: 480, nodes: nodesFor('nibe-price'),
