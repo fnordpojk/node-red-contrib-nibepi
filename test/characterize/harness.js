@@ -81,10 +81,13 @@ function makeCore(sc, trace, model) {
             if (!meta.has(addr)) return Promise.reject(new Error('Register (' + addr + ') not in database'));
             const v = read(addr);
             if (v === 'timeout') return Promise.reject(new Error('No respond from register (' + addr + ')'));
+            // As the core does: the model's register object, with raw_data the scaled value
+            // and data the same value, or its text when the model maps it (e.g. 41929's
+            // price levels 1/2/3 -> CHEAP/NORMAL/EXPENSIVE).
             const m = meta.get(addr);
-            const factor = Number(m.factor) || 1;
-            const d = { register: addr, titel: m.titel, info: m.info, unit: m.unit, data: v,
-                        raw_data: Math.round(v * factor), timestamp: Date.now() };
+            const mapped = Array.isArray(m.map) ? m.map.find(e => Number(Object.keys(e)[0]) == v) : undefined;
+            const d = Object.assign({}, m, { register: addr, data: mapped ? Object.values(mapped)[0] : v,
+                        raw_data: v, timestamp: Date.now() });
             data.emit('data', d);
             return Promise.resolve(d);
         },
