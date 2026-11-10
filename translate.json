@@ -250,9 +250,9 @@
       "DE": "<p><b>RMU-40</b></p>"
     },
     "rmu_info": {
-      "SE": "<p><b>Virtuell RMU-40</b><br><i>Aktivera en virtuell RMU-40 för att kunna simulera en riktig inomhusgivare via MQTT<br>OBS. har du en riktig RMU-40 går det inte att simulera</i><br></p>",
-      "EN": "<p><b>Virtual RMU-40</b><br><i>Activate a virtual RMU-40 to integrate any room temperature sensor via MQTT<br>Attention: Does not work if a physical RMU-40 is connected!</i><br></p>",
-      "DE": "<p><b>Virtuelle RMU-40</b><br><i>Aktiviere eine virtuelle RMU-40 um einen beliebigen Raumtemperatursensor per MQTT einzubinden.<br>Hinweis: Funktioniert nicht, wenn eine RMU-40 mit der Wärmepumpe verbunden ist!</i><br></p>"
+      "SE": "<p><b>Virtuell RMU-40</b><br><i>Aktivera en virtuell RMU-40 för att kunna simulera en riktig inomhusgivare via MQTT<br>OBS. har du en riktig RMU-40 går det inte att simulera<br>Via NibeGW måste gatewayen svara för RMU-40: slå på RMU-40 via NibeGW och ange UDP-porten per system nedan (se nibepi-backends README)</i><br></p>",
+      "EN": "<p><b>Virtual RMU-40</b><br><i>Activate a virtual RMU-40 to integrate any room temperature sensor via MQTT<br>Attention: Does not work if a physical RMU-40 is connected!<br>Through NibeGW the gateway must answer for the RMU-40: turn on RMU-40 through NibeGW and set the UDP port per system below (see the nibepi-backend README)</i><br></p>",
+      "DE": "<p><b>Virtuelle RMU-40</b><br><i>Aktiviere eine virtuelle RMU-40 um einen beliebigen Raumtemperatursensor per MQTT einzubinden.<br>Hinweis: Funktioniert nicht, wenn eine RMU-40 mit der Wärmepumpe verbunden ist!<br>Über NibeGW muss das Gateway für die RMU-40 antworten: RMU-40 über NibeGW einschalten und den UDP-Port je System unten angeben (siehe README von nibepi-backend)</i><br></p>"
     },
     "rmu_s1": {
       "SE": "<b>RMU-40 S1</b>",
@@ -268,6 +268,11 @@
       "SE": "<b>RMU-40 S3</b>",
       "EN": "<b>RMU-40 S3</b>",
       "DE": "<b>RMU-40 S3</b>"
+    },
+    "rmu_gateway": {
+      "SE": "<b>RMU-40 via NibeGW</b>",
+      "EN": "<b>RMU-40 through NibeGW</b>",
+      "DE": "<b>RMU-40 über NibeGW</b>"
     },
     "hw_restart": {
       "SE": "<b>Starta om hårdvaran</b>",
